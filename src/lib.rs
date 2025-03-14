@@ -1,4 +1,7 @@
+use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
+use anyhow::Result;
+use thiserror::Error;
 
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Clone, Hash)]
 pub struct WebhookWaitResp {
@@ -41,24 +44,43 @@ pub struct DiscordWebhook {
     pub req_client: reqwest::Client,
 }
 
+#[derive(Error, Debug)]
+pub enum WebhookError {
+    #[error("Invalid webhook with url: {0}!")]
+    InvalidWebhook(String),
+    #[error("Reqwest thrown an exception: {0}")]
+    RequestError(reqwest::Error)
+}
+
+impl From<reqwest::Error> for WebhookError {
+    fn from(value: reqwest::Error) -> Self {
+        WebhookError::RequestError(value)
+    }
+}
+
 impl DiscordWebhook {
-    pub async fn test_webhook_valid(&self) -> bool {
-        let response = self
-            .req_client
+    pub async fn new(&self, url: &str) -> Result<Self> {
+        let client = self.test_webhook_valid(url).await?;
+
+        Ok(Self {
+            webhook_url: url.to_owned(),
+            req_client: client
+        })
+    }
+
+    async fn test_webhook_valid(&self, url: &str) -> Result<reqwest::Client> {
+        let client = reqwest::Client::new();
+        
+        let response = client
             .clone()
             .get(&self.webhook_url)
             .send()
-            .await;
-            // .expect("Err");
-        
-        match response {
-            Ok(response) => {
-                response.status() == 200
-            },
-            Err(msg) => {
-                println!("An error occured at testing the webhook validity: {}", msg);
-                false
-            }
+            .await?.error_for_status()?;
+
+        if response.status() != StatusCode::OK {
+            Err(WebhookError::InvalidWebhook(url.to_owned()).into())
+        } else {
+            Ok(client)
         }
     }
 
@@ -136,7 +158,7 @@ impl DiscordWebhook {
             },
             Err(msg) => {
                 println!("An error occured at deleting a webhook msg: {}", msg);
-            }   
+            }
         }
     }
 }
