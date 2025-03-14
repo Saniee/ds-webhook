@@ -58,30 +58,30 @@ impl From<reqwest::Error> for WebhookError {
     }
 }
 
+async fn test_webhook_valid(url: &str) -> Result<reqwest::Client> {
+    let client = reqwest::Client::new();
+    
+    let response = client
+        .clone()
+        .get(url)
+        .send()
+        .await?.error_for_status()?;
+
+    if response.status() != StatusCode::OK {
+        Err(WebhookError::InvalidWebhook(url.to_owned()).into())
+    } else {
+        Ok(client)
+    }
+}
+
 impl DiscordWebhook {
-    pub async fn new(&self, url: &str) -> Result<Self> {
-        let client = self.test_webhook_valid(url).await?;
+    pub async fn new(url: &str) -> Result<Self> {
+        let client = test_webhook_valid(url).await?;
 
         Ok(Self {
             webhook_url: url.to_owned(),
             req_client: client
         })
-    }
-
-    async fn test_webhook_valid(&self, url: &str) -> Result<reqwest::Client> {
-        let client = reqwest::Client::new();
-        
-        let response = client
-            .clone()
-            .get(&self.webhook_url)
-            .send()
-            .await?.error_for_status()?;
-
-        if response.status() != StatusCode::OK {
-            Err(WebhookError::InvalidWebhook(url.to_owned()).into())
-        } else {
-            Ok(client)
-        }
     }
 
     pub fn hex_to_dec(&self, hex: &str) -> u64 {
