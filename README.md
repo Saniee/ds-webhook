@@ -1,6 +1,6 @@
 # ds-webhook
 
-A (somewhat) feature complete discord webhook wrapper for simple apps.
+A (somewhat) feature complete discord webhook wrapper written in rust, for simple apps.
 
 ## Depends on these libraries:
 
