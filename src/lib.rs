@@ -20,7 +20,7 @@ pub struct MessageBuilder {
 #[derive(Default, Debug, Clone, Serialize, Deserialize)]
 pub struct Embed {
     pub title: Option<String>,
-    pub description: String,
+    pub description: Option<String>,
     pub url: Option<String>,
     pub timestamp: Option<u128>,
     pub color: Option<u64>,
