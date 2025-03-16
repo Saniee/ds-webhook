@@ -9,7 +9,7 @@ pub struct WebhookWaitResp {
 }
 
 #[derive(Default, Debug, Clone, Serialize, Deserialize)]
-pub struct WebhookContent {
+pub struct MessageBuilder {
     #[serde(rename = "content")]
     pub message: Option<String>,
     pub username: Option<String>,
@@ -20,7 +20,7 @@ pub struct WebhookContent {
 #[derive(Default, Debug, Clone, Serialize, Deserialize)]
 pub struct Embed {
     pub title: Option<String>,
-    pub description: Option<String>,
+    pub description: String,
     pub url: Option<String>,
     pub timestamp: Option<u128>,
     pub color: Option<u64>,
@@ -88,7 +88,7 @@ impl DiscordWebhook {
         u64::from_str_radix(hex, 16).expect("Err")
     }
 
-    pub async fn send(&self, content: WebhookContent) -> u64 {
+    pub async fn send(&self, content: MessageBuilder) -> u64 {
         let response = self
             .req_client
             .clone()
@@ -116,7 +116,7 @@ impl DiscordWebhook {
         }
     }
 
-    pub async fn edit(&self, content: WebhookContent, msg_id: u64) -> u64 {
+    pub async fn edit(&self, content: MessageBuilder, msg_id: u64) -> u64 {
         let response = self
             .req_client
             .clone()
