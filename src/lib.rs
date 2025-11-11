@@ -55,7 +55,7 @@ pub struct Field {
 pub struct DiscordWebhook {
     pub webhook_url: String,
     pub thread_webhook_url: String,
-    pub req_client: reqwest::blocking::Client,
+    pub req_client: reqwest::Client,
 }
 
 #[derive(Error, Debug)]
@@ -74,10 +74,10 @@ impl From<reqwest::Error> for WebhookError {
     }
 }
 
-async fn test_webhook_valid(url: &str) -> Result<reqwest::blocking::Client> {
-    let client = reqwest::blocking::Client::new();
+async fn test_webhook_valid(url: &str) -> Result<reqwest::Client> {
+    let client = reqwest::Client::new();
 
-    let response = client.clone().get(url).send()?.error_for_status()?;
+    let response = client.clone().get(url).send().await?.error_for_status()?;
 
     if response.status() != StatusCode::OK {
         Err(WebhookError::InvalidWebhook(url.to_owned()).into())
@@ -108,8 +108,10 @@ impl DiscordWebhook {
             .clone()
             .post(self.thread_webhook_url.clone() + "?wait=true")
             .json(&thread)
-            .send()?
-            .json::<WebhookWaitResp>()?;
+            .send()
+            .await?
+            .json::<WebhookWaitResp>()
+            .await?;
 
         Ok((
             response.id.unwrap_or_default().parse::<u64>()?,
@@ -127,8 +129,10 @@ impl DiscordWebhook {
             .req_client
             .post(self.thread_webhook_url.clone() + &format!("?wait=true&thread_id={thread_id}"))
             .json(&thread)
-            .send()?
-            .json::<WebhookWaitResp>()?;
+            .send()
+            .await?
+            .json::<WebhookWaitResp>()
+            .await?;
 
         Ok((
             response
@@ -158,8 +162,10 @@ impl DiscordWebhook {
                     + &format!("/messages/{msg_id}?thread_id={thread_id}"),
             )
             .json(&thread)
-            .send()?
-            .json::<WebhookWaitResp>()?;
+            .send()
+            .await?
+            .json::<WebhookWaitResp>()
+            .await?;
 
         Ok((
             response
@@ -181,8 +187,10 @@ impl DiscordWebhook {
             .clone()
             .post(self.webhook_url.clone() + "?wait=true")
             .json(&content)
-            .send()?
-            .json::<WebhookWaitResp>()?;
+            .send()
+            .await?
+            .json::<WebhookWaitResp>()
+            .await?;
 
         Ok(response
             .id
@@ -197,8 +205,10 @@ impl DiscordWebhook {
             .clone()
             .patch(self.webhook_url.clone() + &format!("/messages/{msg_id}"))
             .json(&content)
-            .send()?
-            .json::<WebhookWaitResp>()?;
+            .send()
+            .await?
+            .json::<WebhookWaitResp>()
+            .await?;
 
         Ok(response
             .id
@@ -212,7 +222,8 @@ impl DiscordWebhook {
             .req_client
             .clone()
             .delete(self.webhook_url.clone() + &format!("/messages/{msg_id}"))
-            .send()?;
+            .send()
+            .await?;
 
         if let Err(msg) = response.error_for_status() {
             Err(WebhookError::ApiError(msg.to_string()).into())
