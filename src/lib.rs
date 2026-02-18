@@ -10,6 +10,19 @@ pub struct WebhookWaitResp {
     pub thread_id: Option<String>,
 }
 
+#[derive(Debug, Serialize, Deserialize, PartialEq, PartialOrd, Clone)]
+pub struct WebhookRateLimitResp {
+    pub message: String,
+    pub retry_after: f64,
+    pub global: bool
+}
+
+pub struct SenderReturn {
+    pub message_id: u64,
+    pub thread_id: u64,
+    pub rate_limit: Option<WebhookRateLimitResp>
+}
+
 #[derive(Default, Debug, Clone, Serialize, Deserialize)]
 pub struct MessageBuilder {
     #[serde(rename = "content")]
@@ -66,6 +79,8 @@ pub enum WebhookError {
     RequestError(reqwest::Error),
     #[error("Webhook API has thrown an exception: ErrorMsg > {0}!")]
     ApiError(String),
+    #[error("Rate Limited! Wait for {0} seconds.")]
+    RateLimited(f64),
 }
 
 impl From<reqwest::Error> for WebhookError {
@@ -118,13 +133,12 @@ impl DiscordWebhook {
             response.thread_id.unwrap_or_default().parse::<u64>()?,
         ))
     }
-
-    /** Returns both the message id, and thread id. <br/> Message ID is first, Thread ID is second. */
+    
     pub async fn send_to_thread(
         &self,
         thread: ThreadBuilder,
         thread_id: u64,
-    ) -> Result<(u64, u64)> {
+    ) -> Result<SenderReturn> {
         let response = self
             .req_client
             .post(self.thread_webhook_url.clone() + &format!("?wait=true&thread_id={thread_id}"))
@@ -132,26 +146,31 @@ impl DiscordWebhook {
             .send()
             .await?;
         
-        if response.headers().get("Retry-After").is_some() {
-            panic!("Rate Limited!");
+        if response.status().as_u16() == 429 {
+            let data = response.json::<WebhookRateLimitResp>().await?;
+            let resp = SenderReturn {
+                message_id: 0,
+                thread_id: 0,
+                rate_limit: Some(data),
+            };
+            Ok(resp)
         } else {
-            let resp = response.json::<WebhookWaitResp>().await?;
-            
-            Ok((
-            resp
+            let data = response.json::<WebhookWaitResp>().await?;
+            let resp = SenderReturn {
+                message_id: data
                 .id
                 .unwrap_or_default()
                 .parse::<u64>()
-                .unwrap_or_default(),
-            resp
+                .unwrap_or_default(),,
+                thread_id: data
                 .thread_id
                 .unwrap_or_default()
                 .parse::<u64>()
                 .unwrap_or_default(),
-        ))
+                rate_limit: None,
+            };
+            Ok(resp)
         }
-        
-        
     }
 
     pub async fn edit_thread_msg(
