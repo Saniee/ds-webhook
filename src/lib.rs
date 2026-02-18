@@ -130,22 +130,28 @@ impl DiscordWebhook {
             .post(self.thread_webhook_url.clone() + &format!("?wait=true&thread_id={thread_id}"))
             .json(&thread)
             .send()
-            .await?
-            .json::<WebhookWaitResp>()
             .await?;
-
-        Ok((
-            response
+        
+        if response.headers().get("Retry-After").is_some() {
+            panic!("Rate Limited!");
+        } else {
+            let resp = response.json::<WebhookWaitResp>().await?;
+            
+            Ok((
+            resp
                 .id
                 .unwrap_or_default()
                 .parse::<u64>()
                 .unwrap_or_default(),
-            response
+            resp
                 .thread_id
                 .unwrap_or_default()
                 .parse::<u64>()
                 .unwrap_or_default(),
         ))
+        }
+        
+        
     }
 
     pub async fn edit_thread_msg(
