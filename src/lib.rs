@@ -161,7 +161,7 @@ impl DiscordWebhook {
                 .id
                 .unwrap_or_default()
                 .parse::<u64>()
-                .unwrap_or_default(),,
+                .unwrap_or_default(),
                 thread_id: data
                 .thread_id
                 .unwrap_or_default()
