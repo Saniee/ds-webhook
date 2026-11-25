@@ -1,0 +1,42 @@
+# TODO
+
+## Fixes to existing methods
+- [x] Default request timeout (about 30s)
+- [x] `new()`: retry on 429 at startup, keep the webhook info, add `from_url()` (no network) and `get_info()` (info is returned by `get_info()`, not stored)
+- [x] `create_thread`: forum `applied_tags`, plus a clear error when the thread name is missing
+- [x] Retry on Discord 502/503/504 (when `with_max_retries` is on)
+- [x] Document how to clear content and embeds on edit
+- [x] Separate types for sending, forum posts and edits, so ignored fields can't be set
+- [x] Rename `SentMessage.thread_id` → `channel_id`
+- [x] Check `with_thread_url` with Discord (plus an unchecked variant)
+- [x] Share the rate-limit wait across clones, and wait before hitting the limit using Discord's rate-limit headers
+
+## Embed builder
+- [ ] `.footer(text)` / `.footer_with_icon(text, url)` shortcuts
+- [ ] `.author(name)` / `.author_with(name, url, icon)` shortcuts
+- [ ] `.timestamp_now()`, `.timestamp_unix(secs)`, and taking chrono dates
+- [ ] `.color_hex("#57F287")` and named Discord colors
+- [ ] `validate()` for Discord's size limits (title 256, description 4096, 25 fields, 6000 characters in total)
+- [ ] Remove, replace or clear fields
+
+## Missing webhook features
+- [ ] File attachments (multipart upload, `attachment://` in embeds, keep or remove on edit)
+- [ ] `allowed_mentions`
+- [ ] Message flags (silent messages, hide link previews)
+- [ ] Get a message by ID
+- [ ] Delete the webhook
+- [ ] Text-to-speech
+- [ ] Polls
+- [ ] Sends that don't wait for Discord's reply
+- [ ] Check message limits before sending (2000 characters, 10 embeds)
+- [ ] Buttons and menus (only useful on webhooks owned by a bot application)
+- [ ] Slack/GitHub-style endpoints
+
+## Repo and release
+- [ ] Commit the current work on `develop/tokio`
+- [ ] Merge into `tokio` and push, so the docs workflow publishes ds-webhook
+- [ ] Bump the action versions in both docs workflows to clear the Node 20 warning
+- [ ] Optionally publish both crates to crates.io (docs.rs then hosts the docs)
+
+## ds-format integration
+- [ ] Optional `ds-format` feature in ds-webhook (`.timestamp(Timestamp)` on embeds)
