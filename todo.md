@@ -20,8 +20,8 @@
 - [x] Remove, replace or clear fields
 
 ## Missing webhook features
-- [ ] File attachments (multipart upload, `attachment://` in embeds, keep or remove on edit)
-- [ ] Image grid from attachments: up to 10 uploaded images per message, shown as a gallery under the text
+- [x] File attachments (multipart upload, `attachment://` in embeds, keep or remove on edit)
+- [x] Image grid from attachments: up to 10 uploaded images per message, shown as a gallery under the text
 - [ ] Media gallery component (Components V2): up to 10 images in one gallery block; check webhook rules first (non-interactive components on plain webhooks need a flag)
 - [ ] `allowed_mentions`
 - [ ] Message flags (silent messages, hide link previews)

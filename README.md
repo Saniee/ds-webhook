@@ -92,6 +92,42 @@ embed.validate()?; // checks Discord's size limits before sending
 - **Colors:** `colors` has Discord's brand colors: `BLURPLE`, `GREEN`, `YELLOW`, `FUCHSIA`, `RED`, `GREYPLE`, `WHITE`.
 - **chrono:** with the `chrono` feature, `.timestamp_datetime(&dt)` takes a chrono date in any time zone.
 
+## Files and image grids
+
+```rust
+use ds_webhook::{Attachment, EditMessage, Embed, MessageBuilder};
+
+// Up to 10 files per message; several images show as a grid.
+let sent = hook
+    .send_message(
+        MessageBuilder::new().content("Screenshots").attachments([
+            Attachment::from_path("1.png")?,
+            Attachment::from_path("2.png")?.description("Settings page"), // alt text
+            Attachment::new("notes.txt", "raw bytes or text").spoiler(),
+        ]),
+    )
+    .await?;
+let first_id = sent.attachments[0].id; // IDs and CDN URLs come back
+
+// Use an uploaded file inside an embed:
+let chart = Attachment::from_path("chart.png")?;
+let msg = MessageBuilder::new()
+    .embed(Embed::new().title("Weekly report").image(chart.url())) // attachment://chart.png
+    .attachment(chart);
+
+// Edit: add a file, keep one of the old ones, drop the rest.
+hook.edit_message(
+    EditMessage::new().attach(Attachment::from_path("3.png")?).keep_attachments([first_id]),
+    sent.message_id,
+)
+.await?;
+```
+
+- **Editing:** attachments stay as they are unless an edit calls `attach`, `keep_attachments` or `clear_attachments`. Discord replaces the whole file list on such an edit, so list every old file you want to keep.
+- **Size:** Discord limits file size per upload, and the limit depends on the server's boost level. Files over the limit come back as an `Api` error with status 413.
+- **Content type:** guessed from the file extension. Override it with `.content_type(..)`.
+- **Retries:** uploads are retried like any other request.
+
 ## Name and avatar
 
 **For one message:** set `username` / `avatar_url` on the `MessageBuilder`, including inside a `ForumPost` or for `send_to_thread`.
@@ -141,7 +177,8 @@ Every call returns `ds_webhook::Result<T>`, with a `WebhookError` that you can m
 | `InvalidWebhook` | The URL can't be parsed, or Discord says the webhook doesn't exist (401/403/404 on a check) |
 | `Api { status, body }` | Discord returned a non-2xx status other than 429 |
 | `RateLimited { retry_after, global }` | Rate limited and no retries left |
-| `InvalidMessage` | A forum post name is empty or longer than 100 characters |
+| `InvalidMessage` | A forum post name is empty or longer than 100 characters, more than 10 attachments, or `Embed::validate` failed |
+| `Io` | `Attachment::from_path` couldn't read the file |
 | `InvalidResponse` | Discord's reply was missing or had malformed IDs |
 | `InvalidColor` | `color_from_hex` got bad input |
 | `InvalidImage` | `ModifyWebhook::avatar` got bytes that aren't PNG, JPEG, GIF or WebP |
@@ -157,7 +194,7 @@ Every call returns `ds_webhook::Result<T>`, with a `WebhookError` that you can m
   - for `create_thread`, use `ForumPost::new(name, message)`
   - for edits, use `EditMessage`
 - `MessageBuilder.message` is renamed to `content`.
-- Send and edit calls return `SentMessage { message_id, channel_id }` instead of tuples or `u64`. For thread messages, `channel_id` is the thread ID.
+- Send and edit calls return `SentMessage { message_id, channel_id, attachments }` instead of tuples or `u64`. For thread messages, `channel_id` is the thread ID.
 - Rate limits come back as `Err(WebhookError::RateLimited { .. })` instead of `SenderReturn.rate_limit`.
 - `Embed.timestamp` is an ISO8601 `String`, `Embed.color` is `u32`, and `Field.inline` is `Option<bool>`.
 - `hook.hex_to_dec(..)` is now the free function `color_from_hex(..)`, which returns a `Result` instead of panicking.

@@ -1,11 +1,11 @@
 use std::time::{Duration, Instant};
 
 use ds_webhook::{
-    DiscordWebhook, EditMessage, ForumPost, MessageBuilder, ModifyWebhook, WebhookError,
+    Attachment, DiscordWebhook, EditMessage, ForumPost, MessageBuilder, ModifyWebhook, WebhookError,
 };
 use serde_json::json;
 use wiremock::matchers::{body_json, method, path, query_param};
-use wiremock::{Mock, MockServer, ResponseTemplate};
+use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 
 const HOOK_PATH: &str = "/api/webhooks/1/token";
 const FORUM_PATH: &str = "/api/webhooks/2/forum-token";
@@ -465,4 +465,121 @@ fn avatar_rejects_unknown_image_data() {
         ModifyWebhook::new().avatar(b"not an image"),
         Err(WebhookError::InvalidImage(_))
     ));
+}
+
+// ---- attachments ----
+
+/// Matches a multipart request whose body contains every `needle`.
+fn multipart_with(needles: &'static [&'static str]) -> impl Fn(&Request) -> bool {
+    move |req: &Request| {
+        let is_multipart = req
+            .headers
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|v| v.starts_with("multipart/form-data"));
+        let body = String::from_utf8_lossy(&req.body);
+        is_multipart && needles.iter().all(|n| body.contains(n))
+    }
+}
+
+fn message_with_attachment() -> ResponseTemplate {
+    ResponseTemplate::new(200).set_body_json(json!({
+        "id": "16", "channel_id": "20",
+        "attachments": [{
+            "id": "500", "filename": "a.png", "size": 4,
+            "url": "https://cdn.discordapp.com/attachments/20/500/a.png"
+        }]
+    }))
+}
+
+#[tokio::test]
+async fn send_message_uploads_files_as_multipart() {
+    let (server, hook) = setup().await;
+    Mock::given(method("POST"))
+        .and(path(HOOK_PATH))
+        .and(query_param("wait", "true"))
+        .and(multipart_with(&[
+            "name=\"payload_json\"",
+            r#""filename":"a.png""#,
+            r#""description":"chart""#,
+            "name=\"files[0]\"; filename=\"a.png\"",
+            "Content-Type: image/png",
+            "PNGDATA",
+        ]))
+        .respond_with(message_with_attachment())
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let msg = MessageBuilder::new()
+        .content("report")
+        .attachment(Attachment::new("a.png", "PNGDATA").description("chart"));
+    let sent = hook.send_message(msg).await.unwrap();
+    assert_eq!(sent.attachments.len(), 1);
+    assert_eq!(sent.attachments[0].id, 500);
+    assert_eq!(sent.attachments[0].filename, "a.png");
+    assert!(sent.attachments[0].url.ends_with("/a.png"));
+}
+
+#[tokio::test]
+async fn upload_is_rebuilt_for_a_retry() {
+    let (server, hook) = setup().await;
+    let hook = hook.with_max_retries(1);
+    Mock::given(method("POST"))
+        .and(multipart_with(&["FILEBODY"]))
+        .respond_with(rate_limited(0.01))
+        .up_to_n_times(1)
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(multipart_with(&["FILEBODY"]))
+        .respond_with(message_with_attachment())
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let msg = MessageBuilder::new().attachment(Attachment::new("a.png", "FILEBODY"));
+    hook.send_message(msg).await.unwrap();
+}
+
+#[tokio::test]
+async fn edit_can_add_a_file_and_keep_an_old_one() {
+    let (server, hook) = setup().await;
+    Mock::given(method("PATCH"))
+        .and(path(format!("{HOOK_PATH}/messages/16")))
+        .and(multipart_with(&[
+            r#"{"id":"500"}"#,
+            r#""filename":"b.txt""#,
+            "name=\"files[0]\"; filename=\"b.txt\"",
+        ]))
+        .respond_with(message_with_attachment())
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let edit = EditMessage::new()
+        .attach(Attachment::new("b.txt", "log"))
+        .keep_attachments([500]);
+    hook.edit_message(edit, 16).await.unwrap();
+}
+
+#[tokio::test]
+async fn forum_post_can_carry_files() {
+    let (server, hook) = setup().await;
+    Mock::given(method("POST"))
+        .and(multipart_with(&[
+            r#""thread_name":"Screens""#,
+            "name=\"files[1]\"; filename=\"2.png\"",
+        ]))
+        .respond_with(message_with_attachment())
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let msg = MessageBuilder::new()
+        .attachments([Attachment::new("1.png", "a"), Attachment::new("2.png", "b")]);
+    hook.create_thread(ForumPost::new("Screens", msg))
+        .await
+        .unwrap();
 }

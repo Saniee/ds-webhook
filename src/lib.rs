@@ -27,9 +27,14 @@
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use std::fmt;
+use std::path::Path;
+
 use base64::Engine as _;
-use reqwest::{Client, RequestBuilder, Response, StatusCode, Url};
-use serde::{Deserialize, Serialize, Serializer, de::DeserializeOwned};
+use bytes::Bytes;
+use reqwest::multipart::{Form, Part};
+use reqwest::{Body, Client, RequestBuilder, Response, StatusCode, Url};
+use serde::{Deserialize, Serialize, Serializer};
 use thiserror::Error;
 
 /// Result type used by every fallible function in this crate.
@@ -79,15 +84,240 @@ pub enum WebhookError {
     /// Avatar bytes are not a PNG, JPEG, GIF or WebP image.
     #[error("invalid avatar image: {0}")]
     InvalidImage(String),
+    /// A file for an [`Attachment`] could not be read.
+    #[error("could not read file: {0}")]
+    Io(#[from] std::io::Error),
 }
 
 /// Message object returned by Discord (only the fields this crate uses).
-#[derive(Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Clone, Hash)]
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq, Clone, Hash)]
 pub struct WebhookWaitResp {
     /// Message ID as Discord sends it (a string).
     pub id: Option<String>,
     /// Channel ID; for thread messages this is the thread ID.
     pub channel_id: Option<String>,
+    /// Files attached to the message.
+    #[serde(default)]
+    pub attachments: Vec<WebhookAttachmentResp>,
+}
+
+/// An attachment as Discord returns it.
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq, Clone, Hash)]
+pub struct WebhookAttachmentResp {
+    /// Attachment ID as Discord sends it (a string).
+    pub id: String,
+    /// File name.
+    pub filename: String,
+    /// CDN URL of the file.
+    #[serde(default)]
+    pub url: String,
+    /// Size in bytes.
+    #[serde(default)]
+    pub size: u64,
+}
+
+/// A file attached to a sent message.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct SentAttachment {
+    /// Attachment ID, for [`EditMessage::keep_attachments`].
+    pub id: u64,
+    /// File name.
+    pub filename: String,
+    /// CDN URL of the file.
+    pub url: String,
+    /// Size in bytes.
+    pub size: u64,
+}
+
+/// A file to upload with a message.
+///
+/// Images show inline; several images on one message show as a grid (up to 10
+/// attachments per message). To show an attachment inside an embed, use
+/// [`url`](Self::url) as the embed image.
+///
+/// ```
+/// use ds_webhook::{Attachment, Embed, MessageBuilder};
+///
+/// let chart = Attachment::new("chart.png", vec![0x89, b'P', b'N', b'G']).description("Build times");
+/// let msg = MessageBuilder::new()
+///     .embed(Embed::new().title("Weekly report").image(chart.url()))
+///     .attachment(chart);
+/// ```
+#[derive(Clone)]
+pub struct Attachment {
+    filename: String,
+    data: Bytes,
+    description: Option<String>,
+    content_type: Option<String>,
+}
+
+impl Attachment {
+    /// A file with this name and content.
+    pub fn new(filename: impl Into<String>, data: impl Into<Bytes>) -> Self {
+        Self {
+            filename: filename.into(),
+            data: data.into(),
+            description: None,
+            content_type: None,
+        }
+    }
+
+    /// Reads a file from disk; the attachment gets the file's name.
+    ///
+    /// This reads the whole file synchronously. For large files in async code,
+    /// read them yourself (e.g. with `tokio::fs::read`) and use [`new`](Self::new).
+    pub fn from_path(path: impl AsRef<Path>) -> Result<Self> {
+        let path = path.as_ref();
+        let filename = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .ok_or_else(|| {
+                WebhookError::InvalidMessage(format!("no usable file name in {}", path.display()))
+            })?
+            .to_owned();
+        Ok(Self::new(filename, std::fs::read(path)?))
+    }
+
+    /// Alt text / description, up to 1024 characters.
+    pub fn description(mut self, text: impl Into<String>) -> Self {
+        self.description = Some(text.into());
+        self
+    }
+
+    /// Hides the file behind a spoiler (Discord does this for names starting with `SPOILER_`).
+    pub fn spoiler(mut self) -> Self {
+        if !self.filename.starts_with("SPOILER_") {
+            self.filename = format!("SPOILER_{}", self.filename);
+        }
+        self
+    }
+
+    /// Overrides the MIME type, which is otherwise guessed from the file extension.
+    pub fn content_type(mut self, mime: impl Into<String>) -> Self {
+        self.content_type = Some(mime.into());
+        self
+    }
+
+    /// The file name as it will be uploaded.
+    pub fn filename(&self) -> &str {
+        &self.filename
+    }
+
+    /// Size in bytes.
+    pub fn len(&self) -> usize {
+        self.data.len()
+    }
+
+    /// Whether the file is empty.
+    pub fn is_empty(&self) -> bool {
+        self.data.is_empty()
+    }
+
+    /// `attachment://<filename>`, to use this file as an embed image or thumbnail.
+    pub fn url(&self) -> String {
+        format!("attachment://{}", self.filename)
+    }
+
+    fn mime(&self) -> &str {
+        if let Some(ct) = &self.content_type {
+            return ct;
+        }
+        let ext = self
+            .filename
+            .rsplit_once('.')
+            .map(|(_, e)| e.to_ascii_lowercase())
+            .unwrap_or_default();
+        match ext.as_str() {
+            "png" => "image/png",
+            "jpg" | "jpeg" => "image/jpeg",
+            "gif" => "image/gif",
+            "webp" => "image/webp",
+            "avif" => "image/avif",
+            "mp4" => "video/mp4",
+            "webm" => "video/webm",
+            "mp3" => "audio/mpeg",
+            "ogg" => "audio/ogg",
+            "txt" | "log" => "text/plain",
+            "json" => "application/json",
+            "pdf" => "application/pdf",
+            "zip" => "application/zip",
+            _ => "application/octet-stream",
+        }
+    }
+}
+
+impl fmt::Debug for Attachment {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Attachment")
+            .field("filename", &self.filename)
+            .field("len", &self.data.len())
+            .field("description", &self.description)
+            .field("content_type", &self.mime())
+            .finish()
+    }
+}
+
+/// Discord allows this many attachments per message.
+const MAX_ATTACHMENTS: usize = 10;
+
+/// A request body: plain JSON, or multipart when files are attached.
+/// Kept around so a retry can rebuild the request (multipart bodies can't be cloned).
+struct Payload {
+    json: serde_json::Value,
+    files: Vec<Attachment>,
+}
+
+impl Payload {
+    /// `keep`: IDs of existing attachments to keep (edits only). `Some` means
+    /// the attachment list is sent, so anything not listed is removed.
+    fn new(body: &impl Serialize, files: &[Attachment], keep: Option<&[u64]>) -> Result<Self> {
+        if files.len() > MAX_ATTACHMENTS {
+            return Err(WebhookError::InvalidMessage(format!(
+                "{} attachments, Discord allows {MAX_ATTACHMENTS}",
+                files.len()
+            )));
+        }
+        if files.iter().any(|f| f.filename.trim().is_empty()) {
+            return Err(WebhookError::InvalidMessage(
+                "attachment file name is empty".to_owned(),
+            ));
+        }
+        let mut json = serde_json::to_value(body)
+            .map_err(|e| WebhookError::InvalidMessage(format!("could not encode message: {e}")))?;
+        if keep.is_some() || !files.is_empty() {
+            let mut list: Vec<serde_json::Value> = keep
+                .unwrap_or_default()
+                .iter()
+                .map(|id| serde_json::json!({ "id": id.to_string() }))
+                .collect();
+            for (i, f) in files.iter().enumerate() {
+                let mut entry = serde_json::json!({ "id": i, "filename": f.filename });
+                if let Some(d) = &f.description {
+                    entry["description"] = d.as_str().into();
+                }
+                list.push(entry);
+            }
+            json["attachments"] = list.into();
+        }
+        Ok(Self {
+            json,
+            files: files.to_vec(),
+        })
+    }
+
+    fn apply(&self, req: RequestBuilder) -> Result<RequestBuilder> {
+        if self.files.is_empty() {
+            return Ok(req.json(&self.json));
+        }
+        let mut form = Form::new().text("payload_json", self.json.to_string());
+        for (i, f) in self.files.iter().enumerate() {
+            let part = Part::stream_with_length(Body::from(f.data.clone()), f.data.len() as u64)
+                .file_name(f.filename.clone())
+                .mime_str(f.mime())?;
+            form = form.part(format!("files[{i}]"), part);
+        }
+        Ok(req.multipart(form))
+    }
 }
 
 /// Body Discord sends with an HTTP 429 response.
@@ -105,12 +335,14 @@ pub struct WebhookRateLimitResp {
 }
 
 /// IDs of a message that was sent or edited.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct SentMessage {
     /// ID of the message.
     pub message_id: u64,
     /// Channel the message is in. For thread and forum messages this is the thread ID.
     pub channel_id: u64,
+    /// Files now attached to the message, with their IDs and CDN URLs.
+    pub attachments: Vec<SentAttachment>,
 }
 
 /// A new message, for [`DiscordWebhook::send_message`] and [`DiscordWebhook::send_to_thread`].
@@ -130,9 +362,24 @@ pub struct MessageBuilder {
     /// Embeds, up to 10.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub embeds: Option<Vec<Embed>>,
+    /// Files to upload, up to 10. Several images show as a grid.
+    #[serde(skip)]
+    pub attachments: Vec<Attachment>,
 }
 
 impl MessageBuilder {
+    /// Attaches a file. Discord allows up to 10 per message.
+    pub fn attachment(mut self, file: Attachment) -> Self {
+        self.attachments.push(file);
+        self
+    }
+
+    /// Attaches several files, e.g. images for a grid (up to 10).
+    pub fn attachments<I: IntoIterator<Item = Attachment>>(mut self, files: I) -> Self {
+        self.attachments.extend(files);
+        self
+    }
+
     /// Creates an empty message.
     pub fn new() -> Self {
         Self::default()
@@ -227,16 +474,27 @@ fn ids_as_strings<S: Serializer>(ids: &[u64], s: S) -> std::result::Result<S::Ok
 /// [`DiscordWebhook::edit_thread_msg`].
 ///
 /// Anything not set stays as it is. To remove something, use
-/// [`clear_content`](Self::clear_content) or [`clear_embeds`](Self::clear_embeds).
+/// [`clear_content`](Self::clear_content), [`clear_embeds`](Self::clear_embeds) or
+/// [`clear_attachments`](Self::clear_attachments).
 /// A message's name and avatar can't be changed after sending.
 ///
+/// **Attachments:** existing files stay unless you call [`attach`](Self::attach),
+/// [`keep_attachments`](Self::keep_attachments) or `clear_attachments`. Discord
+/// replaces the whole file list on such an edit, so when attaching new files,
+/// list the existing ones you want to keep (their IDs are in
+/// [`SentMessage::attachments`]).
+///
 /// ```
-/// use ds_webhook::{EditMessage, Embed};
+/// use ds_webhook::{Attachment, EditMessage, Embed};
 ///
 /// // Replace the embeds, keep the text:
 /// let edit = EditMessage::new().embed(Embed::new().title("Done"));
 /// // Remove the text, keep the embeds:
 /// let edit = EditMessage::new().clear_content();
+/// // Add a file and keep existing attachment 1234:
+/// let edit = EditMessage::new()
+///     .attach(Attachment::new("log.txt", "all good"))
+///     .keep_attachments([1234]);
 /// ```
 #[derive(Default, Debug, Clone, Serialize)]
 pub struct EditMessage {
@@ -246,9 +504,37 @@ pub struct EditMessage {
     /// New embeds, replacing all existing ones. `Some(vec![])` removes them.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub embeds: Option<Vec<Embed>>,
+    /// New files to upload.
+    #[serde(skip)]
+    pub attachments: Vec<Attachment>,
+    /// IDs of existing attachments to keep. `None` keeps all of them, unless new
+    /// files are attached; `Some(vec![])` removes all of them.
+    #[serde(skip)]
+    pub keep_attachments: Option<Vec<u64>>,
 }
 
 impl EditMessage {
+    /// Uploads a new file. Existing attachments are removed unless listed in
+    /// [`keep_attachments`](Self::keep_attachments).
+    pub fn attach(mut self, file: Attachment) -> Self {
+        self.attachments.push(file);
+        self
+    }
+
+    /// Keeps these existing attachments (by ID) and removes all others.
+    pub fn keep_attachments<I: IntoIterator<Item = u64>>(mut self, ids: I) -> Self {
+        self.keep_attachments
+            .get_or_insert_with(Vec::new)
+            .extend(ids);
+        self
+    }
+
+    /// Removes all existing attachments.
+    pub fn clear_attachments(mut self) -> Self {
+        self.keep_attachments = Some(Vec::new());
+        self
+    }
+
     /// No changes yet.
     pub fn new() -> Self {
         Self::default()
@@ -780,9 +1066,22 @@ fn parse_id(id: Option<String>, what: &str) -> Result<u64> {
 }
 
 fn to_sent(resp: WebhookWaitResp) -> Result<SentMessage> {
+    let attachments = resp
+        .attachments
+        .into_iter()
+        .map(|a| {
+            Ok(SentAttachment {
+                id: parse_id(Some(a.id), "attachment id")?,
+                filename: a.filename,
+                url: a.url,
+                size: a.size,
+            })
+        })
+        .collect::<Result<_>>()?;
     Ok(SentMessage {
         message_id: parse_id(resp.id, "message id")?,
         channel_id: parse_id(resp.channel_id, "channel id")?,
+        attachments,
     })
 }
 
@@ -896,9 +1195,9 @@ impl DiscordWebhook {
     ///
     /// Returns [`WebhookError::InvalidWebhook`] if Discord doesn't know the webhook.
     pub async fn get_info(&self) -> Result<WebhookInfo> {
-        let req = self.client.get(self.webhook_url.clone());
+        let make = || Ok(self.client.get(self.webhook_url.clone()));
         let resp = self
-            .send_with(req, &self.main_gate, self.max_retries)
+            .send_with(make, &self.main_gate, self.max_retries)
             .await
             .map_err(rejected_webhook)?;
         Ok(resp.json().await?)
@@ -911,33 +1210,40 @@ impl DiscordWebhook {
     /// To change the name or avatar for one message only, use
     /// [`MessageBuilder::username`] / [`MessageBuilder::avatar_url`] instead.
     pub async fn modify(&self, changes: ModifyWebhook) -> Result<WebhookInfo> {
-        let req = self.client.patch(self.webhook_url.clone()).json(&changes);
-        self.execute(req, &self.main_gate).await
+        let make = || Ok(self.client.patch(self.webhook_url.clone()).json(&changes));
+        Ok(self
+            .send_with(make, &self.main_gate, self.max_retries)
+            .await?
+            .json()
+            .await?)
     }
 
-    /// Sends a message and returns its IDs.
+    /// Sends a message (with any attached files) and returns its IDs.
     pub async fn send_message(&self, message: MessageBuilder) -> Result<SentMessage> {
-        let req = self
-            .client
-            .post(self.webhook_url.clone())
-            .query(&[("wait", "true")])
-            .json(&message);
-        to_sent(self.execute(req, &self.main_gate).await?)
+        let payload = Payload::new(&message, &message.attachments, None)?;
+        let make = || {
+            payload.apply(
+                self.client
+                    .post(self.webhook_url.clone())
+                    .query(&[("wait", "true")]),
+            )
+        };
+        self.send_message_request(make, &self.main_gate).await
     }
 
     /// Edits a message sent by this webhook.
     pub async fn edit_message(&self, edit: EditMessage, msg_id: u64) -> Result<SentMessage> {
-        let req = self
-            .client
-            .patch(message_url(&self.webhook_url, msg_id))
-            .json(&edit);
-        to_sent(self.execute(req, &self.main_gate).await?)
+        let payload = Payload::new(&edit, &edit.attachments, edit.keep_attachments.as_deref())?;
+        let make = || payload.apply(self.client.patch(message_url(&self.webhook_url, msg_id)));
+        self.send_message_request(make, &self.main_gate).await
     }
 
     /// Deletes a message sent by this webhook.
     pub async fn delete_message(&self, msg_id: u64) -> Result<()> {
-        let req = self.client.delete(message_url(&self.webhook_url, msg_id));
-        self.send(req, &self.main_gate).await.map(drop)
+        let make = || Ok(self.client.delete(message_url(&self.webhook_url, msg_id)));
+        self.send_with(make, &self.main_gate, self.max_retries)
+            .await
+            .map(drop)
     }
 
     /// Creates a new forum post. `channel_id` in the result is the new thread's ID.
@@ -946,12 +1252,15 @@ impl DiscordWebhook {
     /// post name is empty or longer than 100 characters.
     pub async fn create_thread(&self, post: ForumPost) -> Result<SentMessage> {
         post.validate()?;
-        let req = self
-            .client
-            .post(self.thread_url().clone())
-            .query(&[("wait", "true")])
-            .json(&post);
-        to_sent(self.execute(req, self.thread_gate()).await?)
+        let payload = Payload::new(&post, &post.message.attachments, None)?;
+        let make = || {
+            payload.apply(
+                self.client
+                    .post(self.thread_url().clone())
+                    .query(&[("wait", "true")]),
+            )
+        };
+        self.send_message_request(make, self.thread_gate()).await
     }
 
     /// Posts a message into an existing thread or forum post.
@@ -960,13 +1269,16 @@ impl DiscordWebhook {
         message: MessageBuilder,
         thread_id: u64,
     ) -> Result<SentMessage> {
-        let req = self
-            .client
-            .post(self.thread_url().clone())
-            .query(&[("wait", "true")])
-            .query(&[("thread_id", thread_id)])
-            .json(&message);
-        to_sent(self.execute(req, self.thread_gate()).await?)
+        let payload = Payload::new(&message, &message.attachments, None)?;
+        let make = || {
+            payload.apply(
+                self.client
+                    .post(self.thread_url().clone())
+                    .query(&[("wait", "true")])
+                    .query(&[("thread_id", thread_id)]),
+            )
+        };
+        self.send_message_request(make, self.thread_gate()).await
     }
 
     /// Edits a message inside a thread.
@@ -976,21 +1288,28 @@ impl DiscordWebhook {
         thread_id: u64,
         msg_id: u64,
     ) -> Result<SentMessage> {
-        let req = self
-            .client
-            .patch(message_url(self.thread_url(), msg_id))
-            .query(&[("thread_id", thread_id)])
-            .json(&edit);
-        to_sent(self.execute(req, self.thread_gate()).await?)
+        let payload = Payload::new(&edit, &edit.attachments, edit.keep_attachments.as_deref())?;
+        let make = || {
+            payload.apply(
+                self.client
+                    .patch(message_url(self.thread_url(), msg_id))
+                    .query(&[("thread_id", thread_id)]),
+            )
+        };
+        self.send_message_request(make, self.thread_gate()).await
     }
 
     /// Deletes a message inside a thread.
     pub async fn delete_thread_msg(&self, thread_id: u64, msg_id: u64) -> Result<()> {
-        let req = self
-            .client
-            .delete(message_url(self.thread_url(), msg_id))
-            .query(&[("thread_id", thread_id)]);
-        self.send(req, self.thread_gate()).await.map(drop)
+        let make = || {
+            Ok(self
+                .client
+                .delete(message_url(self.thread_url(), msg_id))
+                .query(&[("thread_id", thread_id)]))
+        };
+        self.send_with(make, self.thread_gate(), self.max_retries)
+            .await
+            .map(drop)
     }
 
     /// Rate-limit state for thread calls: separate only if a separate webhook is used.
@@ -1004,33 +1323,29 @@ impl DiscordWebhook {
 
     /// Checks that Discord knows the webhook at `url`.
     async fn check(&self, url: &Url, gate: &RateGate) -> Result<()> {
-        let req = self.client.get(url.clone());
-        self.send_with(req, gate, CHECK_RETRIES)
+        let make = || Ok(self.client.get(url.clone()));
+        self.send_with(make, gate, CHECK_RETRIES)
             .await
             .map(drop)
             .map_err(rejected_webhook)
     }
 
-    async fn execute<T: DeserializeOwned>(
-        &self,
-        req: RequestBuilder,
-        gate: &RateGate,
-    ) -> Result<T> {
-        Ok(self.send(req, gate).await?.json::<T>().await?)
+    /// Sends a message request and reads the returned message.
+    async fn send_message_request<F>(&self, make: F, gate: &RateGate) -> Result<SentMessage>
+    where
+        F: Fn() -> Result<RequestBuilder>,
+    {
+        let resp = self.send_with(make, gate, self.max_retries).await?;
+        to_sent(resp.json::<WebhookWaitResp>().await?)
     }
 
-    async fn send(&self, req: RequestBuilder, gate: &RateGate) -> Result<Response> {
-        self.send_with(req, gate, self.max_retries).await
-    }
-
-    /// Sends the request, waiting for / retrying rate limits and 5xx errors up to
-    /// `retries` times, and maps non-2xx answers to errors.
-    async fn send_with(
-        &self,
-        req: RequestBuilder,
-        gate: &RateGate,
-        retries: u32,
-    ) -> Result<Response> {
+    /// Sends the request built by `make` (called again for every retry), waiting
+    /// for / retrying rate limits and 5xx errors up to `retries` times, and maps
+    /// non-2xx answers to errors.
+    async fn send_with<F>(&self, make: F, gate: &RateGate, retries: u32) -> Result<Response>
+    where
+        F: Fn() -> Result<RequestBuilder>,
+    {
         let mut attempt = 0;
         loop {
             if let Some(wait) = gate.remaining() {
@@ -1043,10 +1358,7 @@ impl DiscordWebhook {
                 tokio::time::sleep(wait).await;
             }
 
-            let this_try = req.try_clone().ok_or_else(|| {
-                WebhookError::InvalidResponse("request body cannot be retried".to_owned())
-            })?;
-            let resp = this_try.send().await?;
+            let resp = make()?.send().await?;
             let status = resp.status();
 
             // Discord says no requests are left in this window: wait before the next one.
@@ -1367,6 +1679,101 @@ mod tests {
         }
         // Counts characters, not bytes.
         assert!(Embed::new().title("č".repeat(256)).validate().is_ok());
+    }
+
+    #[test]
+    fn payload_lists_new_files_with_index_ids() {
+        let msg = MessageBuilder::new().content("hi").attachments([
+            Attachment::new("a.png", vec![1]).description("alt"),
+            Attachment::new("b.txt", "x"),
+        ]);
+        let p = Payload::new(&msg, &msg.attachments, None).unwrap();
+        assert_eq!(
+            p.json,
+            json!({
+                "content": "hi",
+                "attachments": [
+                    { "id": 0, "filename": "a.png", "description": "alt" },
+                    { "id": 1, "filename": "b.txt" }
+                ]
+            })
+        );
+        // No files, no attachment list.
+        let plain = MessageBuilder::new().content("hi");
+        let p = Payload::new(&plain, &plain.attachments, None).unwrap();
+        assert_eq!(p.json, json!({ "content": "hi" }));
+    }
+
+    #[test]
+    fn edit_payload_keeps_listed_attachments() {
+        let edit = EditMessage::new()
+            .attach(Attachment::new("new.png", vec![1]))
+            .keep_attachments([77]);
+        let p = Payload::new(&edit, &edit.attachments, edit.keep_attachments.as_deref()).unwrap();
+        assert_eq!(
+            p.json,
+            json!({ "attachments": [ { "id": "77" }, { "id": 0, "filename": "new.png" } ] })
+        );
+        let clear = EditMessage::new().clear_attachments();
+        let p = Payload::new(
+            &clear,
+            &clear.attachments,
+            clear.keep_attachments.as_deref(),
+        )
+        .unwrap();
+        assert_eq!(p.json, json!({ "attachments": [] }));
+        // Untouched: attachments are not mentioned, so Discord keeps them.
+        let text = EditMessage::new().content("x");
+        let p = Payload::new(&text, &text.attachments, text.keep_attachments.as_deref()).unwrap();
+        assert_eq!(p.json, json!({ "content": "x" }));
+    }
+
+    #[test]
+    fn payload_rejects_more_than_ten_files() {
+        let msg = MessageBuilder::new()
+            .attachments((0..11).map(|i| Attachment::new(format!("{i}.png"), vec![1])));
+        assert!(matches!(
+            Payload::new(&msg, &msg.attachments, None),
+            Err(WebhookError::InvalidMessage(_))
+        ));
+    }
+
+    #[test]
+    fn attachment_details() {
+        let a = Attachment::new("Chart.PNG", vec![1, 2, 3])
+            .spoiler()
+            .spoiler();
+        assert_eq!(a.filename(), "SPOILER_Chart.PNG");
+        assert_eq!(a.url(), "attachment://SPOILER_Chart.PNG");
+        assert_eq!(a.mime(), "image/png");
+        assert_eq!(a.len(), 3);
+        assert_eq!(
+            Attachment::new("x.bin", vec![]).mime(),
+            "application/octet-stream"
+        );
+        assert_eq!(
+            Attachment::new("x", vec![]).content_type("text/csv").mime(),
+            "text/csv"
+        );
+        assert!(
+            !format!("{a:?}").contains("[1, 2, 3]"),
+            "Debug must not dump bytes"
+        );
+    }
+
+    #[test]
+    fn attachment_from_path_reads_file_and_name() {
+        let dir = std::env::temp_dir().join(format!("ds-webhook-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("report.txt");
+        std::fs::write(&path, "hello").unwrap();
+        let a = Attachment::from_path(&path).unwrap();
+        assert_eq!((a.filename(), a.len()), ("report.txt", 5));
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert!(matches!(
+            Attachment::from_path(dir.join("missing.txt")),
+            Err(WebhookError::Io(_))
+        ));
     }
 
     #[test]
