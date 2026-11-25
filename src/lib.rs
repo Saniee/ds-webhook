@@ -1,3 +1,6 @@
+//! **Discontinued:** this blocking version is no longer maintained.
+//! Use the async (tokio) version: <https://github.com/Saniee/ds-webhook/tree/tokio>
+
 use anyhow::{Ok, Result};
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
