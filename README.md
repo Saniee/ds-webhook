@@ -62,6 +62,36 @@ async fn main() -> anyhow::Result<()> {
 
 **Editing:** anything you don't set stays as it is. `clear_content()` removes the text, and `clear_embeds()` removes all embeds. Setting embeds replaces all existing ones. A message's name and avatar can't be changed after sending.
 
+## Embeds
+
+```rust
+use ds_webhook::{colors, Embed};
+
+let embed = Embed::new()
+    .title("Build #42")
+    .description("All tests passed")
+    .color(colors::GREEN)              // or .color_hex("#57F287")?
+    .author("CI")                      // or .author_with(name, url, icon_url)
+    .footer("main @ 9648cd0")          // or .footer_with_icon(text, icon_url)
+    .timestamp_now()                   // or .timestamp_unix(secs), .timestamp("2026-11-25T14:30:00Z")
+    .field("Duration", "3m 12s", true)
+    .field("Status", "running", true)
+    .set_field("Status", "done", true); // replaces the existing "Status" field
+
+embed.validate()?; // checks Discord's size limits before sending
+```
+
+- **Fields:** `remove_field(index)`, `remove_fields_named(name)` and `clear_fields()` also exist.
+- **Limits:** `validate()` checks Discord's limits:
+  - title 256 characters, description 4096
+  - up to 25 fields, each with a 1–256 character name and a 1–1024 character value
+  - footer 2048, author name 256
+  - 6000 characters in total
+
+  It returns `InvalidMessage` naming the first limit that's exceeded. The 6000 total covers all embeds in a message together, and `total_chars()` gives each embed's share.
+- **Colors:** `colors` has Discord's brand colors: `BLURPLE`, `GREEN`, `YELLOW`, `FUCHSIA`, `RED`, `GREYPLE`, `WHITE`.
+- **chrono:** with the `chrono` feature, `.timestamp_datetime(&dt)` takes a chrono date in any time zone.
+
 ## Name and avatar
 
 **For one message:** set `username` / `avatar_url` on the `MessageBuilder`, including inside a `ForumPost` or for `send_to_thread`.

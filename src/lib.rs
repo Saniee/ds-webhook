@@ -25,7 +25,7 @@
 //! of a [`DiscordWebhook`], so parallel tasks don't all run into the same limit.
 
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use base64::Engine as _;
 use reqwest::{Client, RequestBuilder, Response, StatusCode, Url};
@@ -338,21 +338,71 @@ impl Embed {
         self
     }
 
-    /// ISO8601 timestamp, e.g. `"2026-11-25T14:30:00Z"`.
+    /// ISO8601 timestamp, e.g. `"2026-11-25T14:30:00Z"`. Shown in each viewer's time zone.
     pub fn timestamp(mut self, timestamp: impl Into<String>) -> Self {
         self.timestamp = Some(timestamp.into());
         self
     }
 
-    /// Sets the color of the side bar. Use [`color_from_hex`] for hex strings.
+    /// Sets the timestamp to the current time.
+    pub fn timestamp_now(self) -> Self {
+        let secs = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs() as i64);
+        self.timestamp_unix(secs)
+    }
+
+    /// Sets the timestamp from unix seconds.
+    ///
+    /// ```
+    /// let e = ds_webhook::Embed::new().timestamp_unix(1_795_617_000);
+    /// assert_eq!(e.timestamp.as_deref(), Some("2026-11-25T14:30:00Z"));
+    /// ```
+    pub fn timestamp_unix(self, secs: i64) -> Self {
+        self.timestamp(unix_to_iso8601(secs))
+    }
+
+    /// Sets the timestamp from a chrono date in any time zone. Needs the `chrono` feature.
+    #[cfg(feature = "chrono")]
+    pub fn timestamp_datetime<Tz: chrono::TimeZone>(self, dt: &chrono::DateTime<Tz>) -> Self {
+        self.timestamp(
+            dt.with_timezone(&chrono::Utc)
+                .to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        )
+    }
+
+    /// Sets the color of the side bar, e.g. `0x57F287` or a constant from [`colors`].
     pub fn color(mut self, color: u32) -> Self {
         self.color = Some(color);
         self
     }
 
-    /// Sets the footer.
-    pub fn footer(mut self, footer: Footer) -> Self {
-        self.footer = Some(footer);
+    /// Sets the color from a hex string such as `"#57F287"` or `"57f287"`.
+    ///
+    /// Returns [`WebhookError::InvalidColor`] for anything else.
+    pub fn color_hex(self, hex: &str) -> Result<Self> {
+        Ok(self.color(color_from_hex(hex)?))
+    }
+
+    /// Sets the footer text (up to 2048 characters).
+    pub fn footer(mut self, text: impl Into<String>) -> Self {
+        self.footer = Some(Footer {
+            text: text.into(),
+            icon_url: None,
+        });
+        self
+    }
+
+    /// Sets the footer text with a small icon next to it.
+    pub fn footer_with_icon(
+        mut self,
+        text: impl Into<String>,
+        icon_url: impl Into<String>,
+    ) -> Self {
+        self.footer = Some(Footer {
+            text: text.into(),
+            icon_url: Some(icon_url.into()),
+        });
         self
     }
 
@@ -368,9 +418,28 @@ impl Embed {
         self
     }
 
-    /// Sets the author line.
-    pub fn author(mut self, author: Author) -> Self {
-        self.author = Some(author);
+    /// Sets the author line above the title (up to 256 characters).
+    pub fn author(mut self, name: impl Into<String>) -> Self {
+        self.author = Some(Author {
+            name: name.into(),
+            url: None,
+            icon_url: None,
+        });
+        self
+    }
+
+    /// Sets the author line with a link and a small icon.
+    pub fn author_with(
+        mut self,
+        name: impl Into<String>,
+        url: impl Into<String>,
+        icon_url: impl Into<String>,
+    ) -> Self {
+        self.author = Some(Author {
+            name: name.into(),
+            url: Some(url.into()),
+            icon_url: Some(icon_url.into()),
+        });
         self
     }
 
@@ -386,6 +455,175 @@ impl Embed {
             .push(Field::new(name, value, inline));
         self
     }
+
+    /// Replaces the first field called `name`, or adds it if there is none.
+    ///
+    /// ```
+    /// use ds_webhook::Embed;
+    ///
+    /// let e = Embed::new()
+    ///     .field("Status", "running", true)
+    ///     .set_field("Status", "done", true);
+    /// assert_eq!(e.fields.unwrap()[0].value, "done");
+    /// ```
+    pub fn set_field(
+        mut self,
+        name: impl Into<String>,
+        value: impl Into<String>,
+        inline: bool,
+    ) -> Self {
+        let field = Field::new(name, value, inline);
+        let fields = self.fields.get_or_insert_with(Vec::new);
+        match fields.iter_mut().find(|f| f.name == field.name) {
+            Some(existing) => *existing = field,
+            None => fields.push(field),
+        }
+        self
+    }
+
+    /// Removes the field at `index` (0-based). Does nothing if there is no such field.
+    pub fn remove_field(mut self, index: usize) -> Self {
+        if let Some(fields) = self.fields.as_mut()
+            && index < fields.len()
+        {
+            fields.remove(index);
+        }
+        self
+    }
+
+    /// Removes every field called `name`.
+    pub fn remove_fields_named(mut self, name: &str) -> Self {
+        if let Some(fields) = self.fields.as_mut() {
+            fields.retain(|f| f.name != name);
+        }
+        self
+    }
+
+    /// Removes all fields.
+    pub fn clear_fields(mut self) -> Self {
+        self.fields = None;
+        self
+    }
+
+    /// Characters that count towards Discord's 6000-character limit per message:
+    /// title, description, field names and values, footer text and author name.
+    pub fn total_chars(&self) -> usize {
+        let len = |s: &Option<String>| s.as_deref().map_or(0, |s| s.chars().count());
+        len(&self.title)
+            + len(&self.description)
+            + self.footer.as_ref().map_or(0, |f| f.text.chars().count())
+            + self.author.as_ref().map_or(0, |a| a.name.chars().count())
+            + self
+                .fields
+                .iter()
+                .flatten()
+                .map(|f| f.name.chars().count() + f.value.chars().count())
+                .sum::<usize>()
+    }
+
+    /// Checks Discord's embed limits, so a send doesn't fail with HTTP 400:
+    /// title 256, description 4096, 25 fields (name 1-256, value 1-1024),
+    /// footer 2048, author name 256, and 6000 characters in total.
+    ///
+    /// Returns [`WebhookError::InvalidMessage`] naming the first limit that is exceeded.
+    /// The 6000-character total applies to all embeds of a message together, so
+    /// check [`total_chars`](Self::total_chars) too when sending several.
+    pub fn validate(&self) -> Result<()> {
+        check_len("title", self.title.as_deref(), 0, 256)?;
+        check_len("description", self.description.as_deref(), 0, 4096)?;
+        check_len(
+            "footer text",
+            self.footer.as_ref().map(|f| f.text.as_str()),
+            1,
+            2048,
+        )?;
+        check_len(
+            "author name",
+            self.author.as_ref().map(|a| a.name.as_str()),
+            1,
+            256,
+        )?;
+        let fields = self.fields.as_deref().unwrap_or_default();
+        if fields.len() > 25 {
+            return Err(WebhookError::InvalidMessage(format!(
+                "embed has {} fields, Discord allows 25",
+                fields.len()
+            )));
+        }
+        for (i, f) in fields.iter().enumerate() {
+            check_len(&format!("field {i} name"), Some(&f.name), 1, 256)?;
+            check_len(&format!("field {i} value"), Some(&f.value), 1, 1024)?;
+        }
+        let total = self.total_chars();
+        if total > 6000 {
+            return Err(WebhookError::InvalidMessage(format!(
+                "embed has {total} characters in total, Discord allows 6000"
+            )));
+        }
+        Ok(())
+    }
+}
+
+/// Checks that `text` (if present) has between `min` and `max` characters.
+/// Whitespace-only text counts as empty, since Discord rejects it.
+fn check_len(what: &str, text: Option<&str>, min: usize, max: usize) -> Result<()> {
+    let Some(text) = text else { return Ok(()) };
+    let len = if text.trim().is_empty() {
+        0
+    } else {
+        text.chars().count()
+    };
+    if len < min {
+        return Err(WebhookError::InvalidMessage(format!(
+            "embed {what} is empty"
+        )));
+    }
+    if len > max {
+        return Err(WebhookError::InvalidMessage(format!(
+            "embed {what} is {len} characters, Discord allows {max}"
+        )));
+    }
+    Ok(())
+}
+
+/// Formats unix seconds as `YYYY-MM-DDTHH:MM:SSZ` (UTC).
+fn unix_to_iso8601(secs: i64) -> String {
+    let days = secs.div_euclid(86_400);
+    let rem = secs.rem_euclid(86_400);
+    // Civil-from-days algorithm (Howard Hinnant), valid for the proleptic Gregorian calendar.
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + i64::from(month <= 2);
+    format!(
+        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}Z",
+        rem / 3600,
+        rem % 3600 / 60,
+        rem % 60
+    )
+}
+
+/// Discord's brand colors, for [`Embed::color`].
+pub mod colors {
+    /// `#5865F2`
+    pub const BLURPLE: u32 = 0x5865F2;
+    /// `#57F287`
+    pub const GREEN: u32 = 0x57F287;
+    /// `#FEE75C`
+    pub const YELLOW: u32 = 0xFEE75C;
+    /// `#EB459E`
+    pub const FUCHSIA: u32 = 0xEB459E;
+    /// `#ED4245`
+    pub const RED: u32 = 0xED4245;
+    /// `#99AAB5`
+    pub const GREYPLE: u32 = 0x99AAB5;
+    /// `#FFFFFF`
+    pub const WHITE: u32 = 0xFFFFFF;
 }
 
 /// An image, referenced by URL.
@@ -1022,6 +1260,113 @@ mod tests {
         gate.block_for(Duration::from_secs(10));
         gate.block_for(Duration::from_secs(1));
         assert!(gate.remaining().unwrap() > Duration::from_secs(5));
+    }
+
+    #[test]
+    fn unix_timestamps_format_as_iso8601() {
+        for (secs, iso) in [
+            (0, "1970-01-01T00:00:00Z"),
+            (-1, "1969-12-31T23:59:59Z"),
+            (951_782_400, "2000-02-29T00:00:00Z"),
+            (1_709_208_000, "2024-02-29T12:00:00Z"),
+            (1_795_617_000, "2026-11-25T14:30:00Z"),
+            (4_107_542_399, "2100-02-28T23:59:59Z"),
+        ] {
+            assert_eq!(unix_to_iso8601(secs), iso, "{secs}");
+        }
+        let now = Embed::new().timestamp_now().timestamp.unwrap();
+        assert!(now.starts_with("20") && now.ends_with('Z'), "{now}");
+    }
+
+    #[cfg(feature = "chrono")]
+    #[test]
+    fn chrono_dates_are_converted_to_utc() {
+        use chrono::{FixedOffset, TimeZone};
+        let cet = FixedOffset::east_opt(3600).unwrap();
+        let dt = cet.with_ymd_and_hms(2026, 11, 25, 15, 30, 0).unwrap();
+        let e = Embed::new().timestamp_datetime(&dt);
+        assert_eq!(e.timestamp.as_deref(), Some("2026-11-25T14:30:00Z"));
+    }
+
+    #[test]
+    fn footer_author_and_color_shortcuts() {
+        let e = Embed::new()
+            .footer_with_icon("f", "https://i/f.png")
+            .author_with("a", "https://a", "https://i/a.png")
+            .color_hex("#57F287")
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(&e).unwrap(),
+            json!({
+                "color": colors::GREEN,
+                "footer": { "text": "f", "icon_url": "https://i/f.png" },
+                "author": { "name": "a", "url": "https://a", "icon_url": "https://i/a.png" }
+            })
+        );
+        let plain = Embed::new().footer("f").author("a");
+        assert_eq!(
+            serde_json::to_value(&plain).unwrap(),
+            json!({ "footer": { "text": "f" }, "author": { "name": "a" } })
+        );
+        assert!(Embed::new().color_hex("nope").is_err());
+    }
+
+    #[test]
+    fn field_editing() {
+        let names = |e: &Embed| -> Vec<String> {
+            e.fields
+                .iter()
+                .flatten()
+                .map(|f| format!("{}={}", f.name, f.value))
+                .collect()
+        };
+        let e = Embed::new()
+            .field("a", "1", true)
+            .field("b", "2", true)
+            .field("a", "3", false);
+        assert_eq!(
+            names(&e.clone().set_field("a", "9", true)),
+            ["a=9", "b=2", "a=3"]
+        );
+        assert_eq!(
+            names(&e.clone().set_field("c", "4", true)),
+            ["a=1", "b=2", "a=3", "c=4"]
+        );
+        assert_eq!(names(&e.clone().remove_field(1)), ["a=1", "a=3"]);
+        assert_eq!(names(&e.clone().remove_field(10)), ["a=1", "b=2", "a=3"]);
+        assert_eq!(names(&e.clone().remove_fields_named("a")), ["b=2"]);
+        assert!(e.clear_fields().fields.is_none());
+    }
+
+    #[test]
+    fn validate_checks_discord_limits() {
+        let ok = Embed::new()
+            .title("t")
+            .description("d")
+            .field("n", "v", false);
+        assert!(ok.validate().is_ok());
+        assert_eq!(ok.total_chars(), 4);
+
+        let too_long_title = Embed::new().title("x".repeat(257));
+        let empty_field = Embed::new().field("n", " ", false);
+        let too_many_fields = (0..26).fold(Embed::new(), |e, i| e.field(i.to_string(), "v", true));
+        let too_much_text = Embed::new()
+            .description("x".repeat(4096))
+            .field("n", "y".repeat(1024), false)
+            .field("n", "y".repeat(1024), false); // 6146 chars
+        for (bad, hint) in [
+            (too_long_title, "title"),
+            (empty_field, "field 0 value"),
+            (too_many_fields, "26 fields"),
+            (too_much_text, "6000"),
+        ] {
+            match bad.validate() {
+                Err(WebhookError::InvalidMessage(msg)) => assert!(msg.contains(hint), "{msg}"),
+                other => panic!("expected InvalidMessage for {hint}, got {other:?}"),
+            }
+        }
+        // Counts characters, not bytes.
+        assert!(Embed::new().title("č".repeat(256)).validate().is_ok());
     }
 
     #[test]

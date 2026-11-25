@@ -12,19 +12,20 @@
 - [x] Share the rate-limit wait across clones, and wait before hitting the limit using Discord's rate-limit headers
 
 ## Embed builder
-- [ ] `.footer(text)` / `.footer_with_icon(text, url)` shortcuts
-- [ ] `.author(name)` / `.author_with(name, url, icon)` shortcuts
-- [ ] `.timestamp_now()`, `.timestamp_unix(secs)`, and taking chrono dates
-- [ ] `.color_hex("#57F287")` and named Discord colors
-- [ ] `validate()` for Discord's size limits (title 256, description 4096, 25 fields, 6000 characters in total)
-- [ ] Remove, replace or clear fields
+- [x] `.footer(text)` / `.footer_with_icon(text, url)` shortcuts
+- [x] `.author(name)` / `.author_with(name, url, icon)` shortcuts
+- [x] `.timestamp_now()`, `.timestamp_unix(secs)`, and taking chrono dates
+- [x] `.color_hex("#57F287")` and named Discord colors
+- [x] `validate()` for Discord's size limits (title 256, description 4096, 25 fields, 6000 characters in total)
+- [x] Remove, replace or clear fields
 
 ## Missing webhook features
 - [ ] File attachments (multipart upload, `attachment://` in embeds, keep or remove on edit)
+- [ ] Image grid from attachments: up to 10 uploaded images per message, shown as a gallery under the text
+- [ ] Media gallery component (Components V2): up to 10 images in one gallery block; check webhook rules first (non-interactive components on plain webhooks need a flag)
 - [ ] `allowed_mentions`
 - [ ] Message flags (silent messages, hide link previews)
 - [ ] Get a message by ID
-- [ ] Delete the webhook
 - [ ] Text-to-speech
 - [ ] Polls
 - [ ] Sends that don't wait for Discord's reply
@@ -33,7 +34,7 @@
 - [ ] Slack/GitHub-style endpoints
 
 ## Repo and release
-- [ ] Commit the current work on `develop/tokio`
+- [x] Commit the current work on `develop/tokio`
 - [ ] Merge into `tokio` and push, so the docs workflow publishes ds-webhook
 - [ ] Bump the action versions in both docs workflows to clear the Node 20 warning
 - [ ] Optionally publish both crates to crates.io (docs.rs then hosts the docs)
