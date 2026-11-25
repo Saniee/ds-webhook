@@ -116,6 +116,35 @@ pub struct WebhookAttachmentResp {
     pub size: u64,
 }
 
+/// A message fetched with [`DiscordWebhook::get_message`].
+#[derive(Debug, Clone)]
+pub struct WebhookMessage {
+    /// ID of the message.
+    pub message_id: u64,
+    /// Channel the message is in (the thread ID for thread messages).
+    pub channel_id: u64,
+    /// Text content (empty if there is none).
+    pub content: String,
+    /// Embeds, as Discord returns them.
+    pub embeds: Vec<Embed>,
+    /// Attached files.
+    pub attachments: Vec<SentAttachment>,
+    /// Message flags, see [`flags`].
+    pub flags: u64,
+}
+
+#[derive(Deserialize)]
+struct RawMessage {
+    #[serde(flatten)]
+    ids: WebhookWaitResp,
+    #[serde(default)]
+    content: String,
+    #[serde(default)]
+    embeds: Vec<Embed>,
+    #[serde(default)]
+    flags: u64,
+}
+
 /// A file attached to a sent message.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct SentAttachment {
@@ -365,9 +394,82 @@ pub struct MessageBuilder {
     /// Files to upload, up to 10. Several images show as a grid.
     #[serde(skip)]
     pub attachments: Vec<Attachment>,
+    /// Who may actually be pinged. `None` uses Discord's default (everyone mentioned in the text).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub allowed_mentions: Option<AllowedMentions>,
+    /// Message flags, see [`flags`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub flags: Option<u64>,
+    /// Read the message aloud with text-to-speech.
+    #[serde(skip_serializing_if = "std::ops::Not::not", default)]
+    pub tts: bool,
+    /// A poll to attach. It can't be edited after sending.
+    #[serde(skip_serializing_if = "Option::is_none", skip_deserializing)]
+    pub poll: Option<Poll>,
 }
 
 impl MessageBuilder {
+    /// Attaches a poll. Discord doesn't allow editing it after sending.
+    pub fn poll(mut self, poll: Poll) -> Self {
+        self.poll = Some(poll);
+        self
+    }
+
+    /// Limits who gets pinged, e.g. `AllowedMentions::none()` to never ping anyone.
+    pub fn allowed_mentions(mut self, mentions: AllowedMentions) -> Self {
+        self.allowed_mentions = Some(mentions);
+        self
+    }
+
+    /// Sends without a push or desktop notification ("silent message").
+    pub fn silent(mut self) -> Self {
+        self.flags = Some(self.flags.unwrap_or(0) | flags::SUPPRESS_NOTIFICATIONS);
+        self
+    }
+
+    /// Hides link previews (embeds generated from URLs in the text).
+    pub fn suppress_embeds(mut self) -> Self {
+        self.flags = Some(self.flags.unwrap_or(0) | flags::SUPPRESS_EMBEDS);
+        self
+    }
+
+    /// Reads the message aloud with text-to-speech for people viewing the channel.
+    pub fn tts(mut self) -> Self {
+        self.tts = true;
+        self
+    }
+
+    /// Checks Discord's limits before sending, so a send doesn't fail with HTTP 400:
+    /// not empty, content up to 2000 characters, up to 10 embeds (each passing
+    /// [`Embed::validate`], 6000 characters across all of them), up to 10 files,
+    /// and a username of 1-80 characters.
+    ///
+    /// The send methods call this automatically.
+    pub fn validate(&self) -> Result<()> {
+        let has_content = self
+            .content
+            .as_deref()
+            .is_some_and(|c| !c.trim().is_empty());
+        let embeds = self.embeds.as_deref().unwrap_or_default();
+        if !has_content && embeds.is_empty() && self.attachments.is_empty() && self.poll.is_none() {
+            return Err(WebhookError::InvalidMessage(
+                "message needs content, an embed, a file or a poll".to_owned(),
+            ));
+        }
+        if let Some(poll) = &self.poll {
+            poll.validate()?;
+        }
+        check_message_parts(self.content.as_deref(), embeds, self.attachments.len())?;
+        if let Some(name) = &self.username {
+            let len = name.trim().chars().count();
+            if len == 0 || len > 80 {
+                return Err(WebhookError::InvalidMessage(format!(
+                    "username must be 1-80 characters, got {len}"
+                )));
+            }
+        }
+        Ok(())
+    }
     /// Attaches a file. Discord allows up to 10 per message.
     pub fn attachment(mut self, file: Attachment) -> Self {
         self.attachments.push(file);
@@ -455,19 +557,653 @@ impl ForumPost {
         self
     }
 
-    fn validate(&self) -> Result<()> {
+    /// Checks the post name (1-100 characters) and the first message's limits
+    /// ([`MessageBuilder::validate`]). [`DiscordWebhook::create_thread`] calls this automatically.
+    pub fn validate(&self) -> Result<()> {
         let len = self.thread_name.trim().chars().count();
         if len == 0 || len > 100 {
             return Err(WebhookError::InvalidMessage(format!(
                 "forum post name must be 1-100 characters, got {len}"
             )));
         }
-        Ok(())
+        self.message.validate()
     }
 }
 
 fn ids_as_strings<S: Serializer>(ids: &[u64], s: S) -> std::result::Result<S::Ok, S::Error> {
     s.collect_seq(ids.iter().map(u64::to_string))
+}
+
+/// Message flags a webhook may set.
+pub mod flags {
+    /// Don't show link previews (embeds generated from URLs in the text).
+    pub const SUPPRESS_EMBEDS: u64 = 1 << 2;
+    /// Don't send push or desktop notifications ("silent message").
+    pub const SUPPRESS_NOTIFICATIONS: u64 = 1 << 12;
+    /// The message is built from components only (see [`crate::Component`]).
+    pub const IS_COMPONENTS_V2: u64 = 1 << 15;
+}
+
+/// Who a message may actually ping. Mentions in the text still render, but
+/// only the allowed ones notify anyone.
+///
+/// ```
+/// use ds_webhook::AllowedMentions;
+///
+/// // Never ping anyone, even if the text contains @everyone or <@id>:
+/// let quiet = AllowedMentions::none();
+/// // Only ping these two users:
+/// let some = AllowedMentions::none().users([111u64, 222]);
+/// ```
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(into = "AllowedMentionsWire", from = "AllowedMentionsWire")]
+pub struct AllowedMentions {
+    everyone: bool,
+    all_users: bool,
+    all_roles: bool,
+    users: Vec<u64>,
+    roles: Vec<u64>,
+}
+
+impl AllowedMentions {
+    /// Nobody gets pinged. Add exceptions with the other methods.
+    pub fn none() -> Self {
+        Self::default()
+    }
+
+    /// Everything mentioned in the text pings: `@everyone`/`@here`, users and roles.
+    pub fn all() -> Self {
+        Self {
+            everyone: true,
+            all_users: true,
+            all_roles: true,
+            ..Self::default()
+        }
+    }
+
+    /// Allows `@everyone` and `@here`.
+    pub fn everyone(mut self) -> Self {
+        self.everyone = true;
+        self
+    }
+
+    /// Allows every user mentioned in the text.
+    pub fn all_users(mut self) -> Self {
+        self.all_users = true;
+        self
+    }
+
+    /// Allows every role mentioned in the text.
+    pub fn all_roles(mut self) -> Self {
+        self.all_roles = true;
+        self
+    }
+
+    /// Allows these users (up to 100). Ignored if [`all_users`](Self::all_users) is set.
+    pub fn users<I: IntoIterator<Item = u64>>(mut self, ids: I) -> Self {
+        self.users.extend(ids);
+        self
+    }
+
+    /// Allows these roles (up to 100). Ignored if [`all_roles`](Self::all_roles) is set.
+    pub fn roles<I: IntoIterator<Item = u64>>(mut self, ids: I) -> Self {
+        self.roles.extend(ids);
+        self
+    }
+}
+
+/// The JSON shape Discord expects. Discord rejects `"users"` in `parse` together
+/// with a `users` list (same for roles), so the lists are dropped in that case.
+#[derive(Serialize, Deserialize)]
+struct AllowedMentionsWire {
+    parse: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    users: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    roles: Vec<String>,
+}
+
+impl From<AllowedMentions> for AllowedMentionsWire {
+    fn from(m: AllowedMentions) -> Self {
+        let mut parse = Vec::new();
+        for (on, name) in [
+            (m.all_users, "users"),
+            (m.all_roles, "roles"),
+            (m.everyone, "everyone"),
+        ] {
+            if on {
+                parse.push(name.to_owned());
+            }
+        }
+        let list = |all: bool, ids: &[u64]| {
+            if all {
+                Vec::new()
+            } else {
+                ids.iter().map(u64::to_string).collect()
+            }
+        };
+        Self {
+            users: list(m.all_users, &m.users),
+            roles: list(m.all_roles, &m.roles),
+            parse,
+        }
+    }
+}
+
+impl From<AllowedMentionsWire> for AllowedMentions {
+    fn from(w: AllowedMentionsWire) -> Self {
+        let ids = |v: Vec<String>| v.iter().filter_map(|s| s.parse().ok()).collect();
+        Self {
+            everyone: w.parse.iter().any(|p| p == "everyone"),
+            all_users: w.parse.iter().any(|p| p == "users"),
+            all_roles: w.parse.iter().any(|p| p == "roles"),
+            users: ids(w.users),
+            roles: ids(w.roles),
+        }
+    }
+}
+
+/// A message built from layout components ("Components V2"), for
+/// [`DiscordWebhook::send_components`]. Use it for things classic messages
+/// can't do, such as a gallery of up to 10 images.
+///
+/// Such a message can't have plain content, embeds or uploaded files; put text
+/// in [`Component::text`] and use image URLs in galleries. Plain webhooks can
+/// only send non-interactive components (no buttons or menus).
+///
+/// ```
+/// use ds_webhook::{Component, ComponentMessage, MediaItem};
+///
+/// let msg = ComponentMessage::new()
+///     .component(Component::text("## Release screenshots"))
+///     .component(Component::gallery([
+///         MediaItem::new("https://example.com/1.png").description("Home page"),
+///         MediaItem::new("https://example.com/2.png"),
+///     ]))
+///     .component(Component::separator())
+///     .component(Component::text("-# Taken on v2.0.0"));
+/// ```
+#[derive(Debug, Clone, Default)]
+pub struct ComponentMessage {
+    /// Top-level components, in display order.
+    pub components: Vec<Component>,
+    /// Overrides the webhook's display name for this message.
+    pub username: Option<String>,
+    /// Overrides the webhook's avatar for this message.
+    pub avatar_url: Option<String>,
+    /// Who may be pinged by mentions in text components.
+    pub allowed_mentions: Option<AllowedMentions>,
+    /// Send without notifications.
+    pub silent: bool,
+}
+
+impl ComponentMessage {
+    /// An empty message.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Adds a top-level component.
+    pub fn component(mut self, component: Component) -> Self {
+        self.components.push(component);
+        self
+    }
+
+    /// Overrides the webhook's display name for this message.
+    pub fn username(mut self, username: impl Into<String>) -> Self {
+        self.username = Some(username.into());
+        self
+    }
+
+    /// Overrides the webhook's avatar for this message.
+    pub fn avatar_url(mut self, url: impl Into<String>) -> Self {
+        self.avatar_url = Some(url.into());
+        self
+    }
+
+    /// Limits who gets pinged by mentions in text components.
+    pub fn allowed_mentions(mut self, mentions: AllowedMentions) -> Self {
+        self.allowed_mentions = Some(mentions);
+        self
+    }
+
+    /// Sends without a push or desktop notification.
+    pub fn silent(mut self) -> Self {
+        self.silent = true;
+        self
+    }
+
+    /// Checks Discord's limits: at least one component, at most 40 in total
+    /// (counting nested ones), galleries with 1-10 items, alt text up to 1024
+    /// characters, and up to 4000 characters of text across all text components.
+    /// [`DiscordWebhook::send_components`] calls this automatically.
+    pub fn validate(&self) -> Result<()> {
+        if self.components.is_empty() {
+            return Err(WebhookError::InvalidMessage(
+                "component message needs at least one component".to_owned(),
+            ));
+        }
+        let (mut count, mut text) = (0, 0);
+        for c in &self.components {
+            c.check(&mut count, &mut text)?;
+        }
+        if count > 40 {
+            return Err(WebhookError::InvalidMessage(format!(
+                "{count} components, Discord allows 40"
+            )));
+        }
+        if text > 4000 {
+            return Err(WebhookError::InvalidMessage(format!(
+                "text components have {text} characters together, Discord allows 4000"
+            )));
+        }
+        Ok(())
+    }
+
+    fn to_json(&self) -> serde_json::Value {
+        let mut json = serde_json::json!({
+            "components": self.components,
+            "flags": flags::IS_COMPONENTS_V2
+                | if self.silent { flags::SUPPRESS_NOTIFICATIONS } else { 0 },
+        });
+        if let Some(u) = &self.username {
+            json["username"] = u.as_str().into();
+        }
+        if let Some(a) = &self.avatar_url {
+            json["avatar_url"] = a.as_str().into();
+        }
+        if let Some(m) = &self.allowed_mentions {
+            json["allowed_mentions"] = serde_json::to_value(m).unwrap_or_default();
+        }
+        json
+    }
+}
+
+/// A non-interactive layout component for a [`ComponentMessage`].
+#[derive(Debug, Clone, PartialEq)]
+pub enum Component {
+    /// Markdown text (type 10).
+    Text(String),
+    /// 1-10 images or videos shown as a grid (type 12).
+    MediaGallery(Vec<MediaItem>),
+    /// Vertical space, optionally with a line (type 14).
+    Separator {
+        /// Draw a line.
+        divider: bool,
+        /// Large instead of small padding.
+        large: bool,
+    },
+    /// A box around other components with an optional colored edge, like an embed (type 17).
+    Container {
+        /// Components inside the box (text, galleries, separators).
+        components: Vec<Component>,
+        /// Color of the left edge, e.g. a constant from [`colors`].
+        accent_color: Option<u32>,
+        /// Blur the contents until clicked.
+        spoiler: bool,
+    },
+}
+
+impl Component {
+    /// Markdown text, up to 4000 characters (shared by all text in the message).
+    pub fn text(content: impl Into<String>) -> Self {
+        Self::Text(content.into())
+    }
+
+    /// A gallery of 1-10 images or videos.
+    pub fn gallery<I: IntoIterator<Item = MediaItem>>(items: I) -> Self {
+        Self::MediaGallery(items.into_iter().collect())
+    }
+
+    /// A thin line with small padding.
+    pub fn separator() -> Self {
+        Self::Separator {
+            divider: true,
+            large: false,
+        }
+    }
+
+    /// A box around `components`, like an embed without its limits.
+    pub fn container<I: IntoIterator<Item = Component>>(components: I) -> Self {
+        Self::Container {
+            components: components.into_iter().collect(),
+            accent_color: None,
+            spoiler: false,
+        }
+    }
+
+    /// Sets the edge color of a container. Does nothing for other components.
+    pub fn accent_color(mut self, color: u32) -> Self {
+        if let Self::Container { accent_color, .. } = &mut self {
+            *accent_color = Some(color);
+        }
+        self
+    }
+
+    /// Counts components and text characters, and checks gallery limits.
+    fn check(&self, count: &mut usize, text: &mut usize) -> Result<()> {
+        *count += 1;
+        match self {
+            Self::Text(t) => *text += t.chars().count(),
+            Self::MediaGallery(items) => {
+                if items.is_empty() || items.len() > 10 {
+                    return Err(WebhookError::InvalidMessage(format!(
+                        "media gallery has {} items, Discord allows 1-10",
+                        items.len()
+                    )));
+                }
+                for item in items {
+                    let len = item.description.as_deref().map_or(0, |d| d.chars().count());
+                    if len > 1024 {
+                        return Err(WebhookError::InvalidMessage(format!(
+                            "media alt text is {len} characters, Discord allows 1024"
+                        )));
+                    }
+                }
+            }
+            Self::Separator { .. } => {}
+            Self::Container { components, .. } => {
+                if components.is_empty() {
+                    return Err(WebhookError::InvalidMessage(
+                        "container needs at least one component".to_owned(),
+                    ));
+                }
+                for c in components {
+                    if matches!(c, Self::Container { .. }) {
+                        return Err(WebhookError::InvalidMessage(
+                            "containers can't be nested".to_owned(),
+                        ));
+                    }
+                    c.check(count, text)?;
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Serialize for Component {
+    fn serialize<S: Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        let mut map = s.serialize_map(None)?;
+        match self {
+            Self::Text(content) => {
+                map.serialize_entry("type", &10)?;
+                map.serialize_entry("content", content)?;
+            }
+            Self::MediaGallery(items) => {
+                map.serialize_entry("type", &12)?;
+                map.serialize_entry("items", items)?;
+            }
+            Self::Separator { divider, large } => {
+                map.serialize_entry("type", &14)?;
+                map.serialize_entry("divider", divider)?;
+                map.serialize_entry("spacing", &if *large { 2 } else { 1 })?;
+            }
+            Self::Container {
+                components,
+                accent_color,
+                spoiler,
+            } => {
+                map.serialize_entry("type", &17)?;
+                map.serialize_entry("components", components)?;
+                if let Some(c) = accent_color {
+                    map.serialize_entry("accent_color", c)?;
+                }
+                if *spoiler {
+                    map.serialize_entry("spoiler", &true)?;
+                }
+            }
+        }
+        map.end()
+    }
+}
+
+/// One image or video in a media gallery.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MediaItem {
+    /// Image or video URL.
+    pub url: String,
+    /// Alt text, up to 1024 characters.
+    pub description: Option<String>,
+    /// Blur until clicked.
+    pub spoiler: bool,
+}
+
+impl MediaItem {
+    /// An image or video by URL.
+    pub fn new(url: impl Into<String>) -> Self {
+        Self {
+            url: url.into(),
+            description: None,
+            spoiler: false,
+        }
+    }
+
+    /// Alt text, up to 1024 characters.
+    pub fn description(mut self, text: impl Into<String>) -> Self {
+        self.description = Some(text.into());
+        self
+    }
+
+    /// Blurs the item until clicked.
+    pub fn spoiler(mut self) -> Self {
+        self.spoiler = true;
+        self
+    }
+}
+
+impl Serialize for MediaItem {
+    fn serialize<S: Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        let mut map = s.serialize_map(None)?;
+        map.serialize_entry("media", &serde_json::json!({ "url": self.url }))?;
+        if let Some(d) = &self.description {
+            map.serialize_entry("description", d)?;
+        }
+        if self.spoiler {
+            map.serialize_entry("spoiler", &true)?;
+        }
+        map.end()
+    }
+}
+
+/// A poll, for [`MessageBuilder::poll`].
+///
+/// ```
+/// use ds_webhook::{MessageBuilder, Poll};
+///
+/// let msg = MessageBuilder::new().poll(
+///     Poll::new("Deploy on Friday?")
+///         .answer("Yes")
+///         .answer_with_emoji("No way", "🙅")
+///         .duration_hours(48)
+///         .multiselect(),
+/// );
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Poll {
+    /// The question, 1-300 characters.
+    pub question: String,
+    /// 1-10 answers.
+    pub answers: Vec<PollAnswer>,
+    /// How long the poll is open, 1-768 hours (32 days). `None` uses Discord's default of 24.
+    pub duration_hours: Option<u32>,
+    /// Whether people may pick several answers.
+    pub allow_multiselect: bool,
+}
+
+/// One poll answer: text with an optional emoji.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PollAnswer {
+    /// Answer text, 1-55 characters.
+    pub text: String,
+    /// Optional emoji shown before the text.
+    pub emoji: Option<PollEmoji>,
+}
+
+/// An emoji on a poll answer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PollEmoji {
+    /// A standard emoji, e.g. `"👍"`.
+    Unicode(String),
+    /// A custom server emoji, by ID.
+    Custom(u64),
+}
+
+impl Poll {
+    /// A poll with this question and no answers yet.
+    pub fn new(question: impl Into<String>) -> Self {
+        Self {
+            question: question.into(),
+            answers: Vec::new(),
+            duration_hours: None,
+            allow_multiselect: false,
+        }
+    }
+
+    /// Adds an answer.
+    pub fn answer(mut self, text: impl Into<String>) -> Self {
+        self.answers.push(PollAnswer {
+            text: text.into(),
+            emoji: None,
+        });
+        self
+    }
+
+    /// Adds an answer with a standard emoji, e.g. `"👍"`.
+    pub fn answer_with_emoji(mut self, text: impl Into<String>, emoji: impl Into<String>) -> Self {
+        self.answers.push(PollAnswer {
+            text: text.into(),
+            emoji: Some(PollEmoji::Unicode(emoji.into())),
+        });
+        self
+    }
+
+    /// Adds an answer with a custom server emoji.
+    pub fn answer_with_custom_emoji(mut self, text: impl Into<String>, emoji_id: u64) -> Self {
+        self.answers.push(PollAnswer {
+            text: text.into(),
+            emoji: Some(PollEmoji::Custom(emoji_id)),
+        });
+        self
+    }
+
+    /// How long the poll is open, 1-768 hours (32 days). Default 24.
+    pub fn duration_hours(mut self, hours: u32) -> Self {
+        self.duration_hours = Some(hours);
+        self
+    }
+
+    /// Lets people pick several answers.
+    pub fn multiselect(mut self) -> Self {
+        self.allow_multiselect = true;
+        self
+    }
+
+    /// Checks Discord's poll limits: question 1-300 characters, 1-10 answers of
+    /// 1-55 characters, and a duration of 1-768 hours.
+    pub fn validate(&self) -> Result<()> {
+        let bad = |m: String| Err(WebhookError::InvalidMessage(m));
+        let q = self.question.trim().chars().count();
+        if q == 0 || q > 300 {
+            return bad(format!("poll question must be 1-300 characters, got {q}"));
+        }
+        if self.answers.is_empty() || self.answers.len() > 10 {
+            return bad(format!(
+                "poll has {} answers, Discord allows 1-10",
+                self.answers.len()
+            ));
+        }
+        for (i, a) in self.answers.iter().enumerate() {
+            let len = a.text.trim().chars().count();
+            if len == 0 || len > 55 {
+                return bad(format!(
+                    "poll answer {i} must be 1-55 characters, got {len}"
+                ));
+            }
+        }
+        if let Some(h) = self.duration_hours
+            && !(1..=768).contains(&h)
+        {
+            return bad(format!(
+                "poll duration must be 1-768 hours (32 days), got {h}"
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl Serialize for Poll {
+    fn serialize<S: Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        let answers: Vec<serde_json::Value> = self
+            .answers
+            .iter()
+            .map(|a| {
+                let mut media = serde_json::json!({ "text": a.text });
+                match &a.emoji {
+                    Some(PollEmoji::Unicode(name)) => {
+                        media["emoji"] = serde_json::json!({ "name": name })
+                    }
+                    Some(PollEmoji::Custom(id)) => {
+                        media["emoji"] = serde_json::json!({ "id": id.to_string() })
+                    }
+                    None => {}
+                }
+                serde_json::json!({ "poll_media": media })
+            })
+            .collect();
+        let mut map = s.serialize_map(None)?;
+        map.serialize_entry("question", &serde_json::json!({ "text": self.question }))?;
+        map.serialize_entry("answers", &answers)?;
+        if let Some(h) = self.duration_hours {
+            map.serialize_entry("duration", &h)?;
+        }
+        if self.allow_multiselect {
+            map.serialize_entry("allow_multiselect", &true)?;
+        }
+        map.serialize_entry("layout_type", &1)?;
+        map.end()
+    }
+}
+
+/// Discord's per-message limits that apply to both new and edited messages.
+fn check_message_parts(content: Option<&str>, embeds: &[Embed], files: usize) -> Result<()> {
+    if let Some(c) = content {
+        let len = c.chars().count();
+        if len > 2000 {
+            return Err(WebhookError::InvalidMessage(format!(
+                "content is {len} characters, Discord allows 2000"
+            )));
+        }
+    }
+    if embeds.len() > 10 {
+        return Err(WebhookError::InvalidMessage(format!(
+            "{} embeds, Discord allows 10",
+            embeds.len()
+        )));
+    }
+    for (i, e) in embeds.iter().enumerate() {
+        e.validate().map_err(|err| match err {
+            WebhookError::InvalidMessage(m) => {
+                WebhookError::InvalidMessage(format!("embed {i}: {m}"))
+            }
+            other => other,
+        })?;
+    }
+    let total: usize = embeds.iter().map(Embed::total_chars).sum();
+    if total > 6000 {
+        return Err(WebhookError::InvalidMessage(format!(
+            "embeds have {total} characters together, Discord allows 6000"
+        )));
+    }
+    if files > MAX_ATTACHMENTS {
+        return Err(WebhookError::InvalidMessage(format!(
+            "{files} attachments, Discord allows {MAX_ATTACHMENTS}"
+        )));
+    }
+    Ok(())
 }
 
 /// Changes to an existing message, for [`DiscordWebhook::edit_message`] and
@@ -511,9 +1247,37 @@ pub struct EditMessage {
     /// files are attached; `Some(vec![])` removes all of them.
     #[serde(skip)]
     pub keep_attachments: Option<Vec<u64>>,
+    /// Who may be pinged by mentions added in this edit.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub allowed_mentions: Option<AllowedMentions>,
+    /// New message flags. On edit, only [`flags::SUPPRESS_EMBEDS`] can be changed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub flags: Option<u64>,
 }
 
 impl EditMessage {
+    /// Limits who gets pinged by mentions in the edited text.
+    pub fn allowed_mentions(mut self, mentions: AllowedMentions) -> Self {
+        self.allowed_mentions = Some(mentions);
+        self
+    }
+
+    /// Hides (`true`) or shows again (`false`) link previews.
+    pub fn suppress_embeds(mut self, hide: bool) -> Self {
+        self.flags = Some(if hide { flags::SUPPRESS_EMBEDS } else { 0 });
+        self
+    }
+
+    /// Checks Discord's limits for the new content, embeds and files.
+    /// The edit methods call this automatically.
+    pub fn validate(&self) -> Result<()> {
+        check_message_parts(
+            self.content.as_deref(),
+            self.embeds.as_deref().unwrap_or_default(),
+            self.attachments.len() + self.keep_attachments.as_ref().map_or(0, Vec::len),
+        )
+    }
+
     /// Uploads a new file. Existing attachments are removed unless listed in
     /// [`keep_attachments`](Self::keep_attachments).
     pub fn attach(mut self, file: Attachment) -> Self {
@@ -624,9 +1388,12 @@ impl Embed {
         self
     }
 
-    /// ISO8601 timestamp, e.g. `"2026-11-25T14:30:00Z"`. Shown in each viewer's time zone.
-    pub fn timestamp(mut self, timestamp: impl Into<String>) -> Self {
-        self.timestamp = Some(timestamp.into());
+    /// Sets the timestamp, shown in each viewer's time zone.
+    ///
+    /// Takes an ISO8601 string such as `"2026-11-25T14:30:00Z"`, or with the
+    /// `ds-format` feature a `ds_format::Timestamp`.
+    pub fn timestamp(mut self, timestamp: impl Into<EmbedTimestamp>) -> Self {
+        self.timestamp = Some(timestamp.into().0);
         self
     }
 
@@ -893,6 +1660,57 @@ fn unix_to_iso8601(secs: i64) -> String {
         rem % 60
     )
 }
+
+/// A value accepted by [`Embed::timestamp`]: an ISO8601 string, or with the
+/// `ds-format` feature a `ds_format::Timestamp`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EmbedTimestamp(String);
+
+impl From<String> for EmbedTimestamp {
+    fn from(iso: String) -> Self {
+        Self(iso)
+    }
+}
+
+impl From<&str> for EmbedTimestamp {
+    fn from(iso: &str) -> Self {
+        Self(iso.to_owned())
+    }
+}
+
+impl From<&String> for EmbedTimestamp {
+    fn from(iso: &String) -> Self {
+        Self(iso.clone())
+    }
+}
+
+#[cfg(feature = "ds-format")]
+impl From<ds_format::Timestamp> for EmbedTimestamp {
+    fn from(ts: ds_format::Timestamp) -> Self {
+        Self(unix_to_iso8601(ts.unix()))
+    }
+}
+
+/// The [ds-format](https://github.com/Saniee/ds-format) crate: mentions,
+/// `<t:…>` timestamps and markdown helpers. Needs the `ds-format` feature.
+///
+/// ```
+/// # #[cfg(feature = "ds-format")] {
+/// use ds_webhook::format::prelude::*;
+/// use ds_webhook::{Embed, MessageBuilder};
+///
+/// let ends = Timestamp::parse("2026-11-25 18:00").unwrap();
+/// let msg = MessageBuilder::new()
+///     .content(format!("{} the event ends {}", mention::role(42), ends.relative().bold()))
+///     .embed(Embed::new().title("Event").timestamp(ends));
+/// assert_eq!(
+///     msg.content.as_deref(),
+///     Some("<@&42> the event ends **<t:1795629600:R>**")
+/// );
+/// # }
+/// ```
+#[cfg(feature = "ds-format")]
+pub use ds_format as format;
 
 /// Discord's brand colors, for [`Embed::color`].
 pub mod colors {
@@ -1220,6 +2038,7 @@ impl DiscordWebhook {
 
     /// Sends a message (with any attached files) and returns its IDs.
     pub async fn send_message(&self, message: MessageBuilder) -> Result<SentMessage> {
+        message.validate()?;
         let payload = Payload::new(&message, &message.attachments, None)?;
         let make = || {
             payload.apply(
@@ -1233,9 +2052,61 @@ impl DiscordWebhook {
 
     /// Edits a message sent by this webhook.
     pub async fn edit_message(&self, edit: EditMessage, msg_id: u64) -> Result<SentMessage> {
+        edit.validate()?;
         let payload = Payload::new(&edit, &edit.attachments, edit.keep_attachments.as_deref())?;
         let make = || payload.apply(self.client.patch(message_url(&self.webhook_url, msg_id)));
         self.send_message_request(make, &self.main_gate).await
+    }
+
+    /// Sends a message without waiting for Discord to return it: one round trip
+    /// less, but no IDs come back and Discord may still reject the message
+    /// after answering. Useful for high-volume logging.
+    pub async fn send_message_no_wait(&self, message: MessageBuilder) -> Result<()> {
+        message.validate()?;
+        let payload = Payload::new(&message, &message.attachments, None)?;
+        let make = || payload.apply(self.client.post(self.webhook_url.clone()));
+        self.send_with(make, &self.main_gate, self.max_retries)
+            .await
+            .map(drop)
+    }
+
+    /// Sends a component message, e.g. a media gallery with up to 10 images.
+    pub async fn send_components(&self, message: ComponentMessage) -> Result<SentMessage> {
+        message.validate()?;
+        let json = message.to_json();
+        let make = || {
+            Ok(self
+                .client
+                .post(self.webhook_url.clone())
+                .query(&[("wait", "true"), ("with_components", "true")])
+                .json(&json))
+        };
+        self.send_message_request(make, &self.main_gate).await
+    }
+
+    /// Like [`send_components`](Self::send_components), into a thread.
+    pub async fn send_components_to_thread(
+        &self,
+        message: ComponentMessage,
+        thread_id: u64,
+    ) -> Result<SentMessage> {
+        message.validate()?;
+        let json = message.to_json();
+        let make = || {
+            Ok(self
+                .client
+                .post(self.thread_url().clone())
+                .query(&[("wait", "true"), ("with_components", "true")])
+                .query(&[("thread_id", thread_id)])
+                .json(&json))
+        };
+        self.send_message_request(make, self.thread_gate()).await
+    }
+
+    /// Fetches a message sent by this webhook.
+    pub async fn get_message(&self, msg_id: u64) -> Result<WebhookMessage> {
+        let make = || Ok(self.client.get(message_url(&self.webhook_url, msg_id)));
+        self.fetch_message(make, &self.main_gate).await
     }
 
     /// Deletes a message sent by this webhook.
@@ -1269,6 +2140,7 @@ impl DiscordWebhook {
         message: MessageBuilder,
         thread_id: u64,
     ) -> Result<SentMessage> {
+        message.validate()?;
         let payload = Payload::new(&message, &message.attachments, None)?;
         let make = || {
             payload.apply(
@@ -1288,6 +2160,7 @@ impl DiscordWebhook {
         thread_id: u64,
         msg_id: u64,
     ) -> Result<SentMessage> {
+        edit.validate()?;
         let payload = Payload::new(&edit, &edit.attachments, edit.keep_attachments.as_deref())?;
         let make = || {
             payload.apply(
@@ -1297,6 +2170,37 @@ impl DiscordWebhook {
             )
         };
         self.send_message_request(make, self.thread_gate()).await
+    }
+
+    /// Like [`send_message_no_wait`](Self::send_message_no_wait), into a thread.
+    pub async fn send_to_thread_no_wait(
+        &self,
+        message: MessageBuilder,
+        thread_id: u64,
+    ) -> Result<()> {
+        message.validate()?;
+        let payload = Payload::new(&message, &message.attachments, None)?;
+        let make = || {
+            payload.apply(
+                self.client
+                    .post(self.thread_url().clone())
+                    .query(&[("thread_id", thread_id)]),
+            )
+        };
+        self.send_with(make, self.thread_gate(), self.max_retries)
+            .await
+            .map(drop)
+    }
+
+    /// Fetches a message inside a thread.
+    pub async fn get_thread_msg(&self, thread_id: u64, msg_id: u64) -> Result<WebhookMessage> {
+        let make = || {
+            Ok(self
+                .client
+                .get(message_url(self.thread_url(), msg_id))
+                .query(&[("thread_id", thread_id)]))
+        };
+        self.fetch_message(make, self.thread_gate()).await
     }
 
     /// Deletes a message inside a thread.
@@ -1328,6 +2232,27 @@ impl DiscordWebhook {
             .await
             .map(drop)
             .map_err(rejected_webhook)
+    }
+
+    /// Fetches a full message (content, embeds, files).
+    async fn fetch_message<F>(&self, make: F, gate: &RateGate) -> Result<WebhookMessage>
+    where
+        F: Fn() -> Result<RequestBuilder>,
+    {
+        let raw: RawMessage = self
+            .send_with(make, gate, self.max_retries)
+            .await?
+            .json()
+            .await?;
+        let sent = to_sent(raw.ids)?;
+        Ok(WebhookMessage {
+            message_id: sent.message_id,
+            channel_id: sent.channel_id,
+            content: raw.content,
+            embeds: raw.embeds,
+            attachments: sent.attachments,
+            flags: raw.flags,
+        })
     }
 
     /// Sends a message request and reads the returned message.
@@ -1508,9 +2433,15 @@ mod tests {
     #[test]
     fn forum_post_name_is_validated() {
         assert!(
-            ForumPost::new("ok", MessageBuilder::new())
+            ForumPost::new("ok", MessageBuilder::new().content("x"))
                 .validate()
                 .is_ok()
+        );
+        // The first message must not be empty either.
+        assert!(
+            ForumPost::new("ok", MessageBuilder::new())
+                .validate()
+                .is_err()
         );
         assert!(
             ForumPost::new(" ", MessageBuilder::new())
@@ -1679,6 +2610,205 @@ mod tests {
         }
         // Counts characters, not bytes.
         assert!(Embed::new().title("č".repeat(256)).validate().is_ok());
+    }
+
+    #[test]
+    fn embed_timestamp_accepts_strings() {
+        let owned = String::from("2026-11-25T14:30:00Z");
+        for e in [
+            Embed::new().timestamp("2026-11-25T14:30:00Z"),
+            Embed::new().timestamp(&owned),
+            Embed::new().timestamp(owned.clone()),
+        ] {
+            assert_eq!(e.timestamp.as_deref(), Some("2026-11-25T14:30:00Z"));
+        }
+    }
+
+    #[cfg(feature = "ds-format")]
+    #[test]
+    fn ds_format_timestamps_and_helpers() {
+        use crate::format::prelude::*;
+        let ts = Timestamp::parse("2026-11-25 14:30").unwrap();
+        let e = Embed::new().timestamp(ts);
+        assert_eq!(e.timestamp.as_deref(), Some("2026-11-25T14:30:00Z"));
+        assert_eq!(mention::user(1), "<@1>");
+        assert_eq!("*hi*".escaped().bold(), r"**\*hi\***");
+        assert_eq!(ts.relative(), "<t:1795617000:R>");
+    }
+
+    #[test]
+    fn poll_wire_format() {
+        let poll = Poll::new("Deploy Friday?")
+            .answer("Yes")
+            .answer_with_emoji("No", "🙅")
+            .answer_with_custom_emoji("Maybe", 42)
+            .duration_hours(48)
+            .multiselect();
+        assert_eq!(
+            serde_json::to_value(&poll).unwrap(),
+            json!({
+                "question": { "text": "Deploy Friday?" },
+                "answers": [
+                    { "poll_media": { "text": "Yes" } },
+                    { "poll_media": { "text": "No", "emoji": { "name": "🙅" } } },
+                    { "poll_media": { "text": "Maybe", "emoji": { "id": "42" } } }
+                ],
+                "duration": 48,
+                "allow_multiselect": true,
+                "layout_type": 1
+            })
+        );
+        // Defaults: no duration (Discord uses 24h), single choice.
+        assert_eq!(
+            serde_json::to_value(Poll::new("Q").answer("A")).unwrap(),
+            json!({
+                "question": { "text": "Q" },
+                "answers": [{ "poll_media": { "text": "A" } }],
+                "layout_type": 1
+            })
+        );
+    }
+
+    #[test]
+    fn poll_limits() {
+        let ok = Poll::new("Q").answer("A");
+        assert!(ok.validate().is_ok());
+        assert!(ok.clone().duration_hours(768).validate().is_ok());
+        let bad = [
+            Poll::new("").answer("A"),
+            Poll::new("x".repeat(301)).answer("A"),
+            Poll::new("Q"),
+            (0..11).fold(Poll::new("Q"), |p, i| p.answer(i.to_string())),
+            Poll::new("Q").answer("x".repeat(56)),
+            Poll::new("Q").answer(" "),
+            ok.clone().duration_hours(0),
+            ok.duration_hours(769),
+        ];
+        for p in bad {
+            assert!(
+                matches!(p.validate(), Err(WebhookError::InvalidMessage(_))),
+                "{p:?}"
+            );
+        }
+        // A poll alone is a valid message; a bad poll makes the message invalid.
+        assert!(
+            MessageBuilder::new()
+                .poll(Poll::new("Q").answer("A"))
+                .validate()
+                .is_ok()
+        );
+        assert!(
+            MessageBuilder::new()
+                .poll(Poll::new("Q"))
+                .validate()
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn component_message_wire_format() {
+        let msg = ComponentMessage::new()
+            .component(Component::text("hi"))
+            .component(
+                Component::container([
+                    Component::gallery([
+                        MediaItem::new("https://a/1.png").description("one"),
+                        MediaItem::new("https://a/2.png").spoiler(),
+                    ]),
+                    Component::Separator {
+                        divider: false,
+                        large: true,
+                    },
+                ])
+                .accent_color(colors::BLURPLE),
+            )
+            .username("Bot")
+            .silent();
+        assert_eq!(
+            msg.to_json(),
+            json!({
+                "flags": 32768 | 4096,
+                "username": "Bot",
+                "components": [
+                    { "type": 10, "content": "hi" },
+                    { "type": 17, "accent_color": 0x5865F2, "components": [
+                        { "type": 12, "items": [
+                            { "media": { "url": "https://a/1.png" }, "description": "one" },
+                            { "media": { "url": "https://a/2.png" }, "spoiler": true }
+                        ] },
+                        { "type": 14, "divider": false, "spacing": 2 }
+                    ] }
+                ]
+            })
+        );
+        assert!(msg.validate().is_ok());
+    }
+
+    #[test]
+    fn component_message_limits() {
+        let bad =
+            |m: ComponentMessage| matches!(m.validate(), Err(WebhookError::InvalidMessage(_)));
+        assert!(bad(ComponentMessage::new()));
+        assert!(bad(
+            ComponentMessage::new().component(Component::gallery([]))
+        ));
+        assert!(bad(ComponentMessage::new().component(Component::gallery(
+            (0..11).map(|i| MediaItem::new(format!("https://a/{i}.png")))
+        ))));
+        assert!(bad(
+            ComponentMessage::new().component(Component::text("x".repeat(4001)))
+        ));
+        assert!(bad(ComponentMessage::new().component(
+            Component::container([Component::container([Component::text("x")])])
+        )));
+        assert!(bad((0..41).fold(ComponentMessage::new(), |m, _| m
+            .component(Component::separator()))));
+        let ten = (0..10).map(|i| MediaItem::new(format!("https://a/{i}.png")));
+        assert!(!bad(
+            ComponentMessage::new().component(Component::gallery(ten))
+        ));
+    }
+
+    #[test]
+    fn allowed_mentions_wire_format() {
+        let v = |m: AllowedMentions| serde_json::to_value(m).unwrap();
+        assert_eq!(v(AllowedMentions::none()), json!({ "parse": [] }));
+        assert_eq!(
+            v(AllowedMentions::all()),
+            json!({ "parse": ["users", "roles", "everyone"] })
+        );
+        assert_eq!(
+            v(AllowedMentions::none().users([1]).roles([2])),
+            json!({ "parse": [], "users": ["1"], "roles": ["2"] })
+        );
+        // Discord rejects "users" in parse together with a users list: the list is dropped.
+        assert_eq!(
+            v(AllowedMentions::none().all_users().users([1])),
+            json!({ "parse": ["users"] })
+        );
+        let back: AllowedMentions =
+            serde_json::from_value(json!({ "parse": ["everyone"], "roles": ["5"] })).unwrap();
+        assert_eq!(back, AllowedMentions::none().everyone().roles([5]));
+    }
+
+    #[test]
+    fn edit_flags_and_limits() {
+        assert_eq!(
+            serde_json::to_value(EditMessage::new().suppress_embeds(true)).unwrap(),
+            json!({ "flags": 4 })
+        );
+        assert_eq!(
+            serde_json::to_value(EditMessage::new().suppress_embeds(false)).unwrap(),
+            json!({ "flags": 0 })
+        );
+        assert!(
+            EditMessage::new()
+                .content("x".repeat(2001))
+                .validate()
+                .is_err()
+        );
+        // An edit may leave everything empty (it only changes what is set).
+        assert!(EditMessage::new().validate().is_ok());
     }
 
     #[test]

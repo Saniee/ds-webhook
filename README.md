@@ -128,6 +128,108 @@ hook.edit_message(
 - **Content type:** guessed from the file extension. Override it with `.content_type(..)`.
 - **Retries:** uploads are retried like any other request.
 
+## Galleries of up to 10 images (component messages)
+
+A classic embed shows at most 4 images. For up to 10 in one gallery, send a **component message**:
+
+```rust
+use ds_webhook::{colors, Component, ComponentMessage, MediaItem};
+
+let msg = ComponentMessage::new()
+    .component(Component::text("## Release screenshots"))
+    .component(Component::gallery([
+        MediaItem::new("https://example.com/1.png").description("Home page"),
+        MediaItem::new("https://example.com/2.png").spoiler(),
+        // ... up to 10
+    ]))
+    .component(Component::separator())
+    .component(Component::container([Component::text("Boxed text")]).accent_color(colors::GREEN));
+hook.send_components(msg).await?; // or send_components_to_thread(msg, thread_id)
+```
+
+Discord's rules for these messages:
+- **No classic parts:** no plain `content`, embeds or uploaded files. Put text in `Component::text`, and use image URLs in galleries.
+- **Non-interactive only:** plain webhooks can't send buttons or menus.
+- **Limits:** 1–10 items per gallery, 40 components in total, and 4000 characters of text. `validate()` checks these, and the send calls run it automatically.
+
+## Mentions, silent messages, TTS
+
+```rust
+use ds_webhook::AllowedMentions;
+
+MessageBuilder::new()
+    .content("<@111> deploy done @everyone")
+    .allowed_mentions(AllowedMentions::none().users([111])) // only pings user 111
+    .silent()            // no push/desktop notification
+    .suppress_embeds()   // no link previews
+    .tts();              // read aloud
+```
+
+`AllowedMentions` builders: `none()` and `all()`, then `.everyone()`, `.all_users()`, `.all_roles()`, `.users([..])` and `.roles([..])`. Without it, Discord pings everything mentioned in the text.
+
+## Polls
+
+```rust
+use ds_webhook::Poll;
+
+let msg = MessageBuilder::new().content("Quick vote").poll(
+    Poll::new("Deploy on Friday?")       // 1–300 characters
+        .answer("Yes")                   // 1–10 answers, 1–55 characters each
+        .answer_with_emoji("No way", "🙅")
+        .answer_with_custom_emoji("Maybe", 123456789) // server emoji by ID
+        .duration_hours(48)              // 1–768 hours (32 days), default 24
+        .multiselect(),                  // allow several answers
+);
+hook.send_message(msg).await?;
+```
+
+- **Editing:** a poll can't be changed after it's sent.
+- **Component messages:** a poll can't be combined with a component message.
+- **Ending early:** there's no way to end a poll early through a webhook.
+
+## Fetching and fire-and-forget
+
+- `get_message(id)` / `get_thread_msg(thread_id, id)` return the message's content, embeds, files and flags.
+- `send_message_no_wait(msg)` / `send_to_thread_no_wait(msg, thread_id)` skip waiting for Discord's reply. That saves a round trip but returns no IDs; use it for high-volume logging.
+
+## Limits checked before sending
+
+Every send and edit first runs `validate()` and returns `InvalidMessage` instead of a Discord 400. The limits checked:
+- the message isn't empty
+- content is at most 2000 characters
+- at most 10 embeds, each passing `Embed::validate`, with at most 6000 characters across all of them
+- at most 10 files
+- the username is 1–80 characters
+
+You can also call `MessageBuilder::validate()`, `EditMessage::validate()`, `ForumPost::validate()` or `ComponentMessage::validate()` yourself.
+
+## Optional features
+
+| Feature | Adds |
+| --- | --- |
+| `chrono` | `Embed::timestamp_datetime(&dt)` for chrono dates in any time zone |
+| `ds-format` | Re-exports [ds-format](https://github.com/Saniee/ds-format) as `ds_webhook::format` (mentions, `<t:…>` timestamps, markdown) and lets `Embed::timestamp` take a `ds_format::Timestamp` |
+
+```toml
+ds-webhook = { git = "https://github.com/Saniee/ds-webhook", branch = "tokio", features = ["ds-format"] }
+```
+
+```rust
+use ds_webhook::format::prelude::*; // mentions, markdown, Timestamp, Format trait
+
+let ends = Timestamp::parse("2026-11-25 18:00")?; // read as UTC
+let msg = MessageBuilder::new()
+    .content(format!(
+        "{} the event ends {} ({})",
+        mention::role(42),
+        ends.relative(),
+        ends.short_time().bold(),
+    ))
+    .embed(Embed::new().title(user_title.escaped()).timestamp(ends));
+```
+
+See the [ds-format README](https://github.com/Saniee/ds-format) for everything it offers.
+
 ## Name and avatar
 
 **For one message:** set `username` / `avatar_url` on the `MessageBuilder`, including inside a `ForumPost` or for `send_to_thread`.
@@ -177,7 +279,7 @@ Every call returns `ds_webhook::Result<T>`, with a `WebhookError` that you can m
 | `InvalidWebhook` | The URL can't be parsed, or Discord says the webhook doesn't exist (401/403/404 on a check) |
 | `Api { status, body }` | Discord returned a non-2xx status other than 429 |
 | `RateLimited { retry_after, global }` | Rate limited and no retries left |
-| `InvalidMessage` | A forum post name is empty or longer than 100 characters, more than 10 attachments, or `Embed::validate` failed |
+| `InvalidMessage` | A message breaks one of Discord's limits (see "Limits checked before sending"), e.g. it's empty, too long, has too many embeds, files or gallery items, or a poll breaks its limits |
 | `Io` | `Attachment::from_path` couldn't read the file |
 | `InvalidResponse` | Discord's reply was missing or had malformed IDs |
 | `InvalidColor` | `color_from_hex` got bad input |

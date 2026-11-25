@@ -159,17 +159,125 @@ async fn edit_sends_only_content_and_embeds() {
 async fn api_error_keeps_status_and_body() {
     let (server, hook) = setup().await;
     Mock::given(method("POST"))
-        .respond_with(ResponseTemplate::new(400).set_body_string("Cannot send an empty message"))
+        .respond_with(ResponseTemplate::new(400).set_body_string("Invalid Form Body"))
         .mount(&server)
         .await;
 
-    match hook.send_message(MessageBuilder::new()).await {
+    match hook.send_message(MessageBuilder::new().content("x")).await {
         Err(WebhookError::Api { status, body }) => {
             assert_eq!(status, 400);
-            assert!(body.contains("empty message"));
+            assert!(body.contains("Invalid Form Body"));
         }
         other => panic!("unexpected: {other:?}"),
     }
+}
+
+#[tokio::test]
+async fn invalid_messages_are_rejected_before_sending() {
+    let (server, hook) = setup().await;
+    Mock::given(method("POST"))
+        .respond_with(message("1", "1"))
+        .expect(0)
+        .mount(&server)
+        .await;
+
+    for bad in [
+        MessageBuilder::new(),
+        MessageBuilder::new().content("x".repeat(2001)),
+        MessageBuilder::new().content("x").username(""),
+        (0..11).fold(MessageBuilder::new(), |m, _| {
+            m.embed(ds_webhook::Embed::new().title("t"))
+        }),
+        MessageBuilder::new().embed(ds_webhook::Embed::new().title("x".repeat(300))),
+    ] {
+        let err = hook.send_message(bad).await.err().unwrap();
+        assert!(matches!(err, WebhookError::InvalidMessage(_)), "{err:?}");
+    }
+}
+
+// ---- mentions, flags, tts, fetching, no-wait ----
+
+#[tokio::test]
+async fn mentions_flags_and_tts_are_sent() {
+    let (server, hook) = setup().await;
+    Mock::given(method("POST"))
+        .and(body_json(json!({
+            "content": "<@111> deploy done @everyone",
+            "allowed_mentions": { "parse": [], "users": ["111"] },
+            "flags": 4100,
+            "tts": true
+        })))
+        .respond_with(message("17", "20"))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let msg = MessageBuilder::new()
+        .content("<@111> deploy done @everyone")
+        .allowed_mentions(ds_webhook::AllowedMentions::none().users([111]))
+        .silent()
+        .suppress_embeds()
+        .tts();
+    hook.send_message(msg).await.unwrap();
+}
+
+#[tokio::test]
+async fn get_message_returns_content_embeds_and_files() {
+    let (server, hook) = setup().await;
+    Mock::given(method("GET"))
+        .and(path(format!("{HOOK_PATH}/messages/18")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": "18", "channel_id": "20", "content": "hello", "flags": 4,
+            "embeds": [{ "type": "rich", "title": "T", "color": 5793266,
+                         "fields": [{ "name": "a", "value": "b", "inline": true }] }],
+            "attachments": [{ "id": "9", "filename": "x.png", "url": "https://cdn/x.png",
+                              "proxy_url": "https://media/x.png", "size": 3 }],
+            "author": { "id": "1", "username": "Bot", "bot": true }
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let msg = hook.get_message(18).await.unwrap();
+    assert_eq!((msg.message_id, msg.channel_id), (18, 20));
+    assert_eq!(msg.content, "hello");
+    assert_eq!(msg.flags, 4);
+    assert_eq!(msg.embeds[0].title.as_deref(), Some("T"));
+    assert_eq!(msg.attachments[0].id, 9);
+}
+
+#[tokio::test]
+async fn get_thread_msg_passes_thread_id() {
+    let (server, hook) = setup().await;
+    Mock::given(method("GET"))
+        .and(path(format!("{HOOK_PATH}/messages/19")))
+        .and(query_param("thread_id", "99"))
+        .respond_with(message("19", "99"))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let msg = hook.get_thread_msg(99, 19).await.unwrap();
+    assert_eq!(msg.channel_id, 99);
+    assert_eq!(msg.content, "");
+}
+
+#[tokio::test]
+async fn no_wait_sends_skip_the_wait_parameter() {
+    let (server, hook) = setup().await;
+    Mock::given(method("POST"))
+        .and(path(HOOK_PATH))
+        .and(|req: &Request| !req.url.query().unwrap_or("").contains("wait="))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(2)
+        .mount(&server)
+        .await;
+
+    hook.send_message_no_wait(MessageBuilder::new().content("log line"))
+        .await
+        .unwrap();
+    hook.send_to_thread_no_wait(MessageBuilder::new().content("log line"), 99)
+        .await
+        .unwrap();
 }
 
 #[tokio::test]
@@ -582,4 +690,84 @@ async fn forum_post_can_carry_files() {
     hook.create_thread(ForumPost::new("Screens", msg))
         .await
         .unwrap();
+}
+
+// ---- components ----
+
+#[tokio::test]
+async fn send_components_uses_with_components_and_v2_flag() {
+    let (server, hook) = setup().await;
+    Mock::given(method("POST"))
+        .and(path(HOOK_PATH))
+        .and(query_param("wait", "true"))
+        .and(query_param("with_components", "true"))
+        .and(body_json(json!({
+            "flags": 32768,
+            "components": [
+                { "type": 12, "items": [
+                    { "media": { "url": "https://a/1.png" } },
+                    { "media": { "url": "https://a/2.png" } }
+                ] }
+            ]
+        })))
+        .respond_with(message("21", "20"))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let msg = ds_webhook::ComponentMessage::new().component(ds_webhook::Component::gallery([
+        ds_webhook::MediaItem::new("https://a/1.png"),
+        ds_webhook::MediaItem::new("https://a/2.png"),
+    ]));
+    let sent = hook.send_components(msg).await.unwrap();
+    assert_eq!(sent.message_id, 21);
+}
+
+#[tokio::test]
+async fn send_components_to_thread_passes_thread_id() {
+    let (server, hook) = setup().await;
+    Mock::given(method("POST"))
+        .and(query_param("with_components", "true"))
+        .and(query_param("thread_id", "99"))
+        .respond_with(message("22", "99"))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let msg = ds_webhook::ComponentMessage::new().component(ds_webhook::Component::text("hi"));
+    hook.send_components_to_thread(msg, 99).await.unwrap();
+}
+
+// ---- polls ----
+
+#[tokio::test]
+async fn poll_is_sent_with_the_message() {
+    let (server, hook) = setup().await;
+    Mock::given(method("POST"))
+        .and(path(HOOK_PATH))
+        .and(body_json(json!({
+            "content": "Quick vote",
+            "poll": {
+                "question": { "text": "Lunch?" },
+                "answers": [
+                    { "poll_media": { "text": "Pizza", "emoji": { "name": "🍕" } } },
+                    { "poll_media": { "text": "Salad" } }
+                ],
+                "duration": 2,
+                "layout_type": 1
+            }
+        })))
+        .respond_with(message("23", "20"))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let msg = MessageBuilder::new().content("Quick vote").poll(
+        ds_webhook::Poll::new("Lunch?")
+            .answer_with_emoji("Pizza", "🍕")
+            .answer("Salad")
+            .duration_hours(2),
+    );
+    let sent = hook.send_message(msg).await.unwrap();
+    assert_eq!(sent.message_id, 23);
 }

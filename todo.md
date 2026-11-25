@@ -22,16 +22,15 @@
 ## Missing webhook features
 - [x] File attachments (multipart upload, `attachment://` in embeds, keep or remove on edit)
 - [x] Image grid from attachments: up to 10 uploaded images per message, shown as a gallery under the text
-- [ ] Media gallery component (Components V2): up to 10 images in one gallery block; check webhook rules first (non-interactive components on plain webhooks need a flag)
-- [ ] `allowed_mentions`
-- [ ] Message flags (silent messages, hide link previews)
-- [ ] Get a message by ID
-- [ ] Text-to-speech
-- [ ] Polls
-- [ ] Sends that don't wait for Discord's reply
-- [ ] Check message limits before sending (2000 characters, 10 embeds)
-- [ ] Buttons and menus (only useful on webhooks owned by a bot application)
-- [ ] Slack/GitHub-style endpoints
+- [x] Media gallery component (Components V2): up to 10 images in one gallery block; check webhook rules first (non-interactive components on plain webhooks need a flag)
+- [x] `allowed_mentions`
+- [x] Message flags (silent messages, hide link previews)
+- [x] Get a message by ID
+- [x] Text-to-speech
+- [x] Polls (question up to 300 characters, up to 10 answers of 55 characters, up to 32 days; can't be edited after sending)
+- [x] Sends that don't wait for Discord's reply
+- [x] Check message limits before sending (2000 characters, 10 embeds)
+- [ ] Link buttons only (style 5, open a URL): test on a real plain webhook first, since Discord's docs don't say whether they count as non-interactive
 
 ## Repo and release
 - [x] Commit the current work on `develop/tokio`
@@ -40,4 +39,4 @@
 - [ ] Optionally publish both crates to crates.io (docs.rs then hosts the docs)
 
 ## ds-format integration
-- [ ] Optional `ds-format` feature in ds-webhook (`.timestamp(Timestamp)` on embeds)
+- [x] Optional `ds-format` feature in ds-webhook (`.timestamp(Timestamp)` on embeds)
